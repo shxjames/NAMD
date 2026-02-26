@@ -1,0 +1,27 @@
+model:
+  target: evaluator.vit.ViT
+  params:
+    image_size: 64
+    patch_size: 8
+    num_classes: 1
+    dim: 1024
+    depth: 6
+    heads: 32
+    mlp_dim: 2048
+    dropout: 0.5
+    emb_dropout: 0.5
+    ckpt_path: YOUR_VIT_CKPT
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 32
+    num_workers: 1
+    pin_memory: True
+    augment: True
+    shuffle: True
+    ch: 1
+    rotate: True
+    angles: [45, 90, 135, 180]
+    model_type: "conditional"
+    base_path: "NLST_with_second_large_cleaned"

@@ -8,6 +8,7 @@ https://github.com/CompVis/taming-transformers
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import LambdaLR
@@ -24,6 +25,10 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+
+##### For LLM
+from ldm.text_encoder import TextContextEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor   ### For Llama 3 or MedGemma
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -97,6 +102,7 @@ class DDPM(pl.LightningModule):
         self.v_posterior = v_posterior
         self.original_elbo_weight = original_elbo_weight
         self.l_simple_weight = l_simple_weight
+        
 
         if monitor is not None:
             self.monitor = monitor
@@ -136,6 +142,8 @@ class DDPM(pl.LightningModule):
         self.register_buffer('betas', to_torch(betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        self.register_buffer('triplet_loss_weight', to_torch(1./(1. + alphas_cumprod/(1-alphas_cumprod))))
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
@@ -184,7 +192,7 @@ class DDPM(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -361,7 +369,6 @@ class DDPM(pl.LightningModule):
             _, loss_dict_ema = self.shared_step(batch)
             loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
         self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
     def on_train_batch_end(self, *args, **kwargs):
         if self.use_ema:
@@ -434,6 +441,7 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
+                 only_model=False,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -465,7 +473,7 @@ class LatentDiffusion(DDPM):
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
+            self.init_from_ckpt(ckpt_path, ignore_keys, only_model=only_model)
             self.restarted_from_ckpt = True
 
     def make_cond_schedule(self, ):
@@ -888,7 +896,7 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, return_ids=False, **kwargs):
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
@@ -984,7 +992,7 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            x_recon = self.model(x_noisy, t, **cond, **kwargs)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1009,10 +1017,10 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, cond, t, noise=None, **kwargs):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy, t, cond, **kwargs)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1027,6 +1035,8 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
+        if self.logvar.device != self.device:
+            self.logvar = self.logvar.to(self.device)
         logvar_t = self.logvar[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
@@ -1391,6 +1401,533 @@ class LatentDiffusion(DDPM):
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
 
+class LatentDiffusionCustom(LatentDiffusion):
+    def __init__(self,
+                 first_stage_config=None,
+                 cond_stage_config="__is_unconditional__",
+                 shift_factor=0.0,
+                 conditioning_mode='clip',
+                 llm_config=None,
+                 ckpt_path=None,
+                 ignore_keys=list(),
+                 *args, **kwargs):
+        # Handle pixel-space diffusion (no first stage)
+        self.pixel_space = first_stage_config is None
+
+        if self.pixel_space:
+            # For pixel space, use identity first stage config
+            first_stage_config = {"target": "torch.nn.Identity"}
+            # Set scale_factor to 1.0 for pixel space
+            kwargs['scale_factor'] = kwargs.get('scale_factor', 1.0)
+
+        super().__init__(first_stage_config, cond_stage_config, *args, **kwargs)
+
+        self.shift_factor = shift_factor
+        assert conditioning_mode in ('clip', 'llm'), \
+            f"conditioning_mode must be 'clip' or 'llm', got '{conditioning_mode}'"
+        self.conditioning_mode = conditioning_mode
+        self._null_llm_emb = None  # cached null embedding (eval only) for llm mode
+
+        self.use_llm = llm_config is not None
+        if self.use_llm:
+            self._init_llm_encoder(llm_config)
+
+        if self.pixel_space:
+            # Override first_stage_model with None for pixel space
+            self.first_stage_model = None
+            print(f"{self.__class__.__name__}: Running in pixel space mode (no VAE)")
+
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys)
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print(f"Deleting key {k} from state_dict.")
+                    del sd[k]
+
+        # Drop any key whose tensor shape doesn't match the current model.
+        target_sd = self.state_dict()
+        mismatched = [
+            k for k in list(sd.keys())
+            if k in target_sd and hasattr(sd[k], "shape") and sd[k].shape != target_sd[k].shape
+        ]
+        for k in mismatched:
+            print(f"Shape mismatch for {k}: ckpt {sd[k].shape} vs model {target_sd[k].shape}. Deleting from state_dict.")
+            del sd[k]
+
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected Keys: {unexpected}")
+
+
+    def _init_llm_encoder(self, llm_config):
+        """Frozen LLM transformer + learnable context tokens and SEG embedding."""
+        self.llm_config = llm_config
+
+        self.contexts = nn.Parameter(
+            llm_config.get_contexts(), requires_grad=True
+        )
+
+    def get_llm_embeddings(self, encoded_sentences):
+        """Run frozen LLM with learnable context/SEG → (B, P, embed_dim)."""
+        if not self.use_llm:
+            return None
+
+        self.llm_config.text_encoder.to(self.device)
+
+        llm_emb = self.llm_config.text_encoder(
+            encoded_sentences,
+            context=self.contexts,
+        )  # (B, P, embed_dim)
+        return llm_emb.to(self.dtype)
+
+    def forward(self, x, c=None, *args, **kwargs):
+        return super().forward(x, c, *args, **kwargs)
+
+    @torch.no_grad()
+    def get_input(self, batch, return_first_stage_outputs=False, reveal_label=False):
+        
+        x = batch[0] # Unconditional Generation
+        labels = batch[1]
+
+        x = x.to(self.device).to(self.dtype)
+        
+        if self.pixel_space:
+            # Pixel space: no encoding needed
+            z = x
+        else:
+            # Latent space: encode through VAE
+            encoder_posterior = self.encode_first_stage(x)
+            z = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        out = [z]
+
+        self.log("z/mean", z.mean())
+        self.log("z/std", z.std())
+
+        batched_prompts = []
+        for label in labels:
+            if not reveal_label:
+                # batched_prompts.append("Generate a lung nodule image.")
+                batched_prompts.append("")
+            elif label.item() == 0:
+                batched_prompts.append("Generate a benign lung nodule image.")
+            elif label.item() == 1:
+                batched_prompts.append("Generate a malignant lung nodule image.")
+            else:
+                raise ValueError(f"Invalid label: {label.item()}")
+            
+        out.append(batched_prompts)
+        if return_first_stage_outputs:
+            if self.pixel_space:
+                xrec = z  # No reconstruction in pixel space
+            else:
+                xrec = self.decode_first_stage(z)
+            out.extend([x, xrec])
+        return out
+    
+    def get_first_stage_encoding(self, encoder_posterior):
+        if self.pixel_space:
+            # Pixel space: return as-is
+            return encoder_posterior
+        
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample()
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior
+        else:
+            raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
+        return self.scale_factor * (z - self.shift_factor)
+    
+    @torch.no_grad()
+    def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
+        if self.pixel_space:
+            # Pixel space: no decoding needed
+            return z
+        z = 1. / self.scale_factor * z + self.shift_factor
+        return self.first_stage_model.decode(z)
+    
+    @torch.no_grad()
+    def encode_first_stage(self, x):
+        if self.pixel_space:
+            # Pixel space: no encoding needed
+            return x
+        return super().encode_first_stage(x)
+
+    def shared_step(self, batch):
+        out = self.get_input(batch)
+
+        x, prompts = out[0], out[1]
+
+        if self.conditioning_mode == 'llm' or self.cond_stage_model is not None:
+            c = self.get_learned_conditioning(prompts)
+        else:
+            c = None
+
+        loss, loss_dict = self(x, c)
+        return loss, loss_dict
+
+    def training_step(self, batch, batch_idx):
+        loss, loss_dict = self.shared_step(batch)
+
+        self.log_dict(loss_dict, prog_bar=True,
+                      logger=True, on_step=True, on_epoch=True)
+
+        self.log("global_step", self.global_step,
+                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+        lr = self.optimizers().param_groups[0]['lr']
+        self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=True)    
+
+        return loss
+
+    # def on_train_start(self):
+    #     self.on_train_epoch_end()
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        _, loss_dict_no_ema = self.shared_step(batch)
+        with self.ema_scope():
+            _, loss_dict_ema = self.shared_step(batch)
+            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+
+    def to_rgb(self, x):
+        """Convert tensor to RGB format for visualization"""
+        # Clamp to [-1, 1] first to avoid overflow when converting to uint8
+        x = torch.clamp(x, -1.0, 1.0)
+        x = (x + 1.0) / 2.0 * 255.0
+        x = x.to(torch.uint8)
+        return x
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        params = list(self.model.parameters())
+
+        if self.conditioning_mode == 'llm' and self.use_llm:
+            params.append(self.contexts)
+            # params.append(self.seg_embedding)
+
+        if self.cond_stage_trainable:
+            params += list(self.cond_stage_model.parameters())
+
+        if self.learn_logvar:
+            params.append(self.logvar)
+
+        opt = torch.optim.AdamW(params, lr=lr)
+        if self.use_scheduler:
+            assert 'target' in self.scheduler_config
+            scheduler = instantiate_from_config(self.scheduler_config)
+
+            print("Setting up LambdaLR scheduler...")
+            scheduler = [
+                {
+                    'scheduler': LambdaLR(opt, lr_lambda=scheduler.schedule),
+                    'interval': 'step',
+                    'frequency': 1
+                }]
+            return [opt], scheduler
+        return opt
+
+    def get_learned_conditioning(self, prompts):
+        if self.pixel_space:
+            return None
+        if self.conditioning_mode == 'llm':
+            from dataset import Demographic_Features
+            # During training, recompute each call so gradients flow through
+            # the learnable contexts/seg_embedding.
+            # During eval/inference, cache the result for efficiency.
+            if not self.training and self._null_llm_emb is not None:
+                null_emb = self._null_llm_emb
+            else:
+                encoded = Demographic_Features.tokenize_prompts(
+                    [""], self.llm_config, use_seg=False
+                ).to(self.device)
+                null_emb = self.get_llm_embeddings(encoded)  # (1, P, embed_dim)
+                if not self.training:
+                    self._null_llm_emb = null_emb
+            bs = len(prompts) if isinstance(prompts, (list, tuple)) else prompts.shape[0]
+            return null_emb.expand(bs, -1, -1)
+        return super().get_learned_conditioning(prompts)
+
+    @torch.no_grad()
+    def sample_log(
+        self,
+        cond,
+        batch_size,
+        ddim_steps,
+        dims=None, 
+        eta=0.0,
+    ):
+        sampler = DDIMSampler(self)
+        sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=eta, verbose=True)
+
+        # Determine dimensions and channels based on pixel vs latent space
+        if self.pixel_space:
+            sample_dims = dims if dims is not None else self.image_size
+            sample_channels = self.channels
+        else:
+            sample_dims = dims if dims is not None else 8  # Default latent size
+            sample_channels = 4  # Latent channels
+
+        ddim_start = torch.randn(batch_size, sample_channels, sample_dims, sample_dims).to(self.device).to(self.dtype)
+
+        samples_ddim, intermediates = sampler.sample(
+            S=ddim_steps,
+            batch_size=batch_size,
+            shape=(sample_channels, sample_dims, sample_dims),
+            conditioning=cond,
+        )
+
+        return samples_ddim
+        
+
+    @torch.no_grad()
+    def log_images(self, batch, N=16):
+        """Generate images for logging using EMA weights"""
+        log = dict()
+        
+        # Get prompts for unconditional generation
+        out = self.get_input(batch)
+        prompts = out[1]
+        
+        # Determine sampling dimensions
+        if self.pixel_space:
+            dims = self.image_size  # e.g., 64 for 64x64 images
+        else:
+            dims = 8  # Latent dimensions for 64x64 images with f8 VAE
+        
+        # Sample new images using DDIM with EMA weights
+        with self.ema_scope("Sampling"):
+            samples_ddim = self.sample_log(
+                cond=self.get_learned_conditioning(prompts[:N]),
+                batch_size=N,
+                ddim_steps=50,
+                dims=dims,
+                eta=0.0
+            )
+            
+            # Decode samples to image space (no-op for pixel space)
+            x_samples_ddim = self.decode_first_stage(samples_ddim)
+        
+        log["samples"] = self.to_rgb(x_samples_ddim)
+        
+        return log
+
+    def _compute_validation_metrics(self, val_loader, prefix="val"):
+        """Compute FID, KID, Precision, Recall, Density, Coverage on validation set using EMA weights"""
+        assert val_loader is not None
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            from torchmetrics.image.kid import KernelInceptionDistance
+        except ImportError:
+            print("Warning: torchmetrics not installed. Skipping metric computation.")
+            return
+        
+        try:
+            from prdc import compute_prdc
+            has_prdc = True
+        except ImportError:
+            print("Warning: prdc not installed. Skipping precision/recall/density/coverage. Install with: pip install prdc")
+            has_prdc = False
+        
+        import torch
+        import numpy as np
+        from torchvision.models import inception_v3
+        import torch.nn.functional as F
+        
+        # Initialize metrics (distribution-based, appropriate for unconditional generation)
+        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(self.device)
+        kid = KernelInceptionDistance(feature=2048, subset_size=50, normalize=True).to(self.device)
+        
+        # For PRDC: we need to collect features from Inception
+        if has_prdc:
+            # Load Inception for feature extraction (same as FID uses)
+            inception = inception_v3(pretrained=True, transform_input=False).to(self.device)
+            inception.eval()
+            # Remove the final fc layer to get 2048-dim features
+            inception.fc = torch.nn.Identity()
+            
+            real_features_list = []
+            gen_features_list = []
+        
+        # Determine sampling dimensions
+        if self.pixel_space:
+            sample_dims = self.image_size  # e.g., 64 for 64x64 images
+        else:
+            sample_dims = 8  # Latent dimensions for 64x64 images with f8 VAE
+        
+        print(f"\nComputing validation metrics with EMA weights...")
+        with torch.no_grad(), self.ema_scope("Validation Metrics"):
+            for batch_idx, batch in enumerate(tqdm(val_loader)):
+                # Get real images
+                x = batch[0]  # Unconditional Generation
+                x = x.to(self.device).to(self.dtype)
+                
+                # Get input and prompts
+                out = self.get_input(batch, return_first_stage_outputs=False)
+                prompts = out[1]
+                batch_size = x.shape[0]
+                
+                # Generate samples
+                samples_ddim = self.sample_log(
+                    cond=self.get_learned_conditioning(prompts),
+                    batch_size=batch_size,
+                    ddim_steps=50,
+                    dims=sample_dims,
+                    eta=0.0
+                )
+                
+                # Decode to image space (no-op for pixel space)
+                generated = self.decode_first_stage(samples_ddim)
+                
+                # Normalize to [0, 1] for metrics
+                generated_norm = torch.clamp((generated + 1.0) / 2.0, 0.0, 1.0)
+                gt_norm = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+                
+                # Convert grayscale to RGB for FID/KID (Inception expects 3 channels)
+                if generated_norm.shape[1] == 1:
+                    generated_rgb = generated_norm.repeat(1, 3, 1, 1)
+                    gt_rgb = gt_norm.repeat(1, 3, 1, 1)
+                else:
+                    generated_rgb = generated_norm
+                    gt_rgb = gt_norm
+                
+                # Update FID and KID (distribution metrics - no pairing needed)
+                fid.update(gt_rgb, real=True)
+                fid.update(generated_rgb, real=False)
+                kid.update(gt_rgb, real=True)
+                kid.update(generated_rgb, real=False)
+                
+                # Extract features for PRDC
+                if has_prdc:
+                    # Resize to 299x299 for Inception and normalize
+                    gt_resized = F.interpolate(gt_rgb, size=(299, 299), mode='bilinear', align_corners=False)
+                    gen_resized = F.interpolate(generated_rgb, size=(299, 299), mode='bilinear', align_corners=False)
+                    
+                    # ImageNet normalization
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+                    gt_normalized = (gt_resized - mean) / std
+                    gen_normalized = (gen_resized - mean) / std
+                    
+                    # Extract features
+                    real_feat = inception(gt_normalized.float()).cpu().numpy()
+                    gen_feat = inception(gen_normalized.float()).cpu().numpy()
+                    real_features_list.append(real_feat)
+                    gen_features_list.append(gen_feat)
+                
+                if batch_idx >= 15:  # Limit to ~50 batches for speed
+                    break
+        
+        # Compute final metrics
+        try:
+            fid_score = fid.compute()
+            kid_mean, kid_std = kid.compute()
+            
+            # Log metrics
+            self.log(f'{prefix}/fid', fid_score, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'{prefix}/kid', kid_mean, on_epoch=True, prog_bar=True, logger=True)
+            
+            print(f"{prefix} Metrics - FID: {fid_score:.4f}, KID: {kid_mean:.4f} ± {kid_std:.4f}")
+            
+            # Compute PRDC (Precision, Recall, Density, Coverage)
+            if has_prdc and len(real_features_list) > 0:
+                real_features = np.concatenate(real_features_list, axis=0)
+                gen_features = np.concatenate(gen_features_list, axis=0)
+                
+                # compute_prdc uses k-nearest neighbors to estimate manifolds
+                prdc_metrics = compute_prdc(
+                    real_features=real_features,
+                    fake_features=gen_features,
+                    nearest_k=5  # k for k-NN manifold estimation
+                )
+                
+                self.log(f'{prefix}/precision', prdc_metrics['precision'], on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'{prefix}/recall', prdc_metrics['recall'], on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'{prefix}/density', prdc_metrics['density'], on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'{prefix}/coverage', prdc_metrics['coverage'], on_epoch=True, prog_bar=True, logger=True)
+                
+                print(f"{prefix} PRDC - Precision: {prdc_metrics['precision']:.4f}, Recall: {prdc_metrics['recall']:.4f}, "
+                      f"Density: {prdc_metrics['density']:.4f}, Coverage: {prdc_metrics['coverage']:.4f}")
+        except Exception as e:
+            print(f"Error computing metrics: {e}")
+
+    def on_train_epoch_end(self):
+        """Log images every 2 epochs and compute validation metrics"""
+        self.num_samples = 16
+        # Get validation loader
+        val_loader = self.trainer.val_dataloaders[0] if hasattr(self.trainer, 'val_dataloaders') else self.trainer.datamodule.val_dataloader()
+        
+        train_loader = self.trainer.train_dataloader if hasattr(self.trainer, 'train_dataloader') else self.trainer.datamodule.train_dataloader()
+        
+        # Compute validation metrics
+        if self.current_epoch % 5 == 0:
+            self._compute_validation_metrics(val_loader, prefix="val")
+        # if self.current_epoch % 10 == 0:
+        #     self._compute_validation_metrics(train_loader, prefix="train")
+        
+        if self.current_epoch % 2 == 0:
+            # Get a batch from validation loader
+            if val_loader is not None:
+                batch = next(iter(val_loader))
+                log = self.log_images(batch, N=self.num_samples)
+                
+                # Log to wandb if available
+                if hasattr(self.trainer.logger, 'experiment') and self.trainer.logger.experiment is not None:
+                    import wandb
+                    import numpy as np
+                    if wandb.run is not None:
+                        # Convert tensors to numpy
+                        samples_np = log["samples"].cpu().numpy()
+                        
+                        # Find largest perfect square <= N
+                        import math
+                        max_samples = min(16, samples_np.shape[0])
+                        grid_size = int(math.sqrt(max_samples))
+                        num_samples = grid_size * grid_size
+                        
+                        # Create grid of generated samples
+                        sample_images = []
+                        
+                        for i in range(num_samples):
+                            # Convert from CHW to HWC for wandb
+                            if samples_np.shape[1] == 1:  # Grayscale
+                                sample_img = samples_np[i, 0]
+                            else:  # RGB
+                                sample_img = samples_np[i].transpose(1, 2, 0)
+                            
+                            sample_images.append(sample_img)
+                        
+                        # Create perfect square grid
+                        rows = []
+                        for row in range(grid_size):
+                            row_images = []
+                            for col in range(grid_size):
+                                idx = row * grid_size + col
+                                row_images.append(sample_images[idx])
+                            row_concat = np.concatenate(row_images, axis=1)
+                            rows.append(row_concat)
+                        
+                        grid_img = np.concatenate(rows, axis=0)
+                        
+                        wandb.log({
+                            "val/generated_samples": wandb.Image(grid_img,
+                                caption=f"Generated samples ({num_samples} unconditional generations)")
+                        }, step=self.global_step)
+
+
 
 class DiffusionWrapper(pl.LightningModule):
     def __init__(self, diff_model_config, conditioning_key):
@@ -1399,22 +1936,22 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, **kwargs):
         if self.conditioning_key is None:
-            out = self.diffusion_model(x, t)
+            out = self.diffusion_model(x, t, **kwargs)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t)
+            out = self.diffusion_model(xc, t, **kwargs)
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            out = self.diffusion_model(x, t, context=cc, **kwargs)
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc)
+            out = self.diffusion_model(xc, t, context=cc, **kwargs)
         elif self.conditioning_key == 'adm':
             cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc)
+            out = self.diffusion_model(x, t, y=cc, **kwargs)
         else:
             raise NotImplementedError()
 
@@ -1443,3 +1980,520 @@ class Layout2ImgDiffusion(LatentDiffusion):
         cond_img = torch.stack(bbox_imgs, dim=0)
         logs['bbox_image'] = cond_img
         return logs
+
+class LatentDiffusionCond_LLM(LatentDiffusion):
+
+    def __init__(self,
+            *args, **kwargs):
+
+        super().__init__( *args, **kwargs)
+        ##### LLM part #####
+        # MedGemma 1.5 4B has hidden_dim = 2560
+        # Llama 3.2 3B has hidden_dim = 3072
+        self.txt_embed_dim = 2560  # MedGemma 1.5 4B hidden dimension
+        self.context_length = 8
+        self.n_prompts = 2
+
+        self.text_encoder = TextContextEncoder(embed_dim=self.txt_embed_dim)
+
+        self.token_embed_dim = self.text_encoder.text_projection.shape[-1]
+        for name, param in self.text_encoder.named_parameters():
+            param.requires_grad_(False)
+
+        self.text_encoder.llm = True
+        self.text_encoder.llm_type = 'medgemma'  # Track which LLM type we're using
+
+        # MedGemma 1.5 4B path
+        # rep_medgemma = '../llm_model/medgemma-1.5-4b'
+        rep_medgemma = "google/medgemma-1.5-4b-it"
+
+        # Use AutoTokenizer for MedGemma (or AutoProcessor if using vision features)
+        self.tokenizer = AutoTokenizer.from_pretrained(rep_medgemma)
+
+        self.max_length = 128
+
+        # Load MedGemma model with 4-bit quantization to save memory
+        # Note: MedGemma 1.5 4B is multimodal, but we only use the text/language model part
+        try:
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            llm_full = AutoModelForCausalLM.from_pretrained(
+                rep_medgemma,
+                quantization_config=quantization_config,
+                device_map="auto",  # auto device placement for quantized model
+            )
+            print("Loaded MedGemma with 4-bit quantization")
+        except ImportError:
+            print("bitsandbytes not installed, loading without quantization")
+            llm_full = AutoModelForCausalLM.from_pretrained(
+                rep_medgemma,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+            )
+
+        # Add special token for medical segmentation
+        self.tokenizer._add_tokens(["<SEG>"], special_tokens=True)
+        llm_full.resize_token_embeddings(len(self.tokenizer) + 1)
+
+        # Extract the language model from MedGemma
+        # MedGemma multimodal structure: llm_full.language_model is Gemma3TextModel
+        # Gemma3TextModel has .embed_tokens for embeddings
+        # For text-only Gemma: llm_full.model is Gemma3TextModel
+        if hasattr(llm_full, 'language_model'):
+            # Multimodal MedGemma structure - language_model IS the Gemma3TextModel
+            self.text_encoder.transformer = llm_full.language_model
+            self.text_encoder.token_embedding = llm_full.language_model.embed_tokens
+        else:
+            # Text-only Gemma structure
+            self.text_encoder.transformer = llm_full.model
+            self.text_encoder.token_embedding = llm_full.model.embed_tokens
+
+        for name, param in self.text_encoder.transformer.named_parameters():
+            param.requires_grad_(False)
+
+        # Per-epoch loss tracking for CSV logging
+        self._train_losses = []
+        self._val_losses = []
+        self._csv_initialized = False
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+        
+        sd_dict = sd['state_dict']
+        model_dict = self.model.state_dict()
+ 
+        for name, weight in sd_dict.items():
+            for name_model, weigh_model in model_dict.items():
+                if name.endswith(name_model):
+                    if model_dict[name_model].shape != weight.shape:
+                        ignore_keys.append(name)
+                        names_no_dot = name.replace(".", "")  ### Remove model_ema.
+                        names_no_dot = 'model_ema.' + names_no_dot[5:]
+                        ignore_keys.append(names_no_dot)
+
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+
+        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+            sd, strict=False)
+        
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected Keys: {unexpected}")
+
+    def _init_csv(self):
+        """Initialize CSV loss log file with header."""
+        import csv
+        log_dir = os.path.join("logs", self._get_project_name())
+        os.makedirs(log_dir, exist_ok=True)
+        self._csv_path = os.path.join(log_dir, "loss_log.csv")
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "epoch",
+                    "train/loss", "train/loss_simple", "train/loss_vlb",
+                    "val/loss", "val/loss_simple", "val/loss_vlb",
+                    "lr",
+                ])
+        self._csv_initialized = True
+
+    def _get_project_name(self):
+        """Derive project name from checkpoint callback dirpath."""
+        for cb in self.trainer.callbacks:
+            if hasattr(cb, 'dirpath') and cb.dirpath:
+                return os.path.basename(cb.dirpath)
+        return "default"
+
+    def forward(self, x, c=None, *args, **kwargs):
+        return super().forward(x, c, *args, **kwargs)
+
+    @torch.no_grad()
+    def get_input(self, batch, return_first_stage_outputs=False, reveal_label=False):
+        
+        # batch torch.tensor(cond_img), torch.tensor(gt_img), torch.tensor(feature.sentence_encoded), torch.tensor(feature.label)
+        x_0 = batch[0]
+        x_1 = batch[1]
+        Sentence_encoded = batch[2]
+        labels = batch[3]
+
+        x_0 = x_0.to(self.device).to(self.dtype)
+        x_1 = x_1.to(self.device).to(self.dtype)
+
+        encoder_posterior_0 = self.encode_first_stage(x_0)
+        z_0 = self.get_first_stage_encoding(encoder_posterior_0).detach()
+        encoder_posterior_1 = self.encode_first_stage(x_1)
+        z_1 = self.get_first_stage_encoding(encoder_posterior_1).detach()
+
+        out = [z_0]
+        out.append(Sentence_encoded)
+        out.append(z_1)
+        out.append(labels)
+
+
+        '''
+        batched_prompts = []
+        for label in labels:
+            if not reveal_label:
+                batched_prompts.append("Generate a lung nodule image.")
+            elif label.item() == 0:
+                batched_prompts.append("Generate a benign lung nodule image.")
+            elif label.item() == 1:
+                batched_prompts.append("Generate a malignant lung nodule image.")
+            else:
+                raise ValueError(f"Invalid label: {label.item()}")
+        
+        out.append(batched_prompts)
+        if return_first_stage_outputs:
+            xrec = self.decode_first_stage(z)
+            out.extend([x, xrec])
+        '''
+
+        return out
+    
+    def get_first_stage_encoding(self, encoder_posterior):
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample()
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior
+        elif isinstance(encoder_posterior, tuple):
+            if len(encoder_posterior) == 3 and isinstance(self.first_stage_model, VQModel):
+                z, _, _ = encoder_posterior
+            else:
+                raise NotImplementedError(f"encoder posterior of type '{type(encoder_posterior)}' not yet implemented for {self.first_stage_model}")
+        else:
+            raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
+        return self.scale_factor * z
+
+    def shared_step(self, batch):
+        out = self.get_input(batch)
+
+        z_0, prompts, z_1 = out[0], out[1], out[2]
+
+        # Ensure contexts is on the correct device and dtype (float32 for stability)
+        contexts = self.model.diffusion_model.contexts
+        if contexts.device != z_0.device or contexts.dtype != torch.float32:
+            contexts = contexts.to(device=z_0.device, dtype=torch.float32)
+
+        # Pass learnable contexts for prompt tuning
+        emb_txt = self.text_encoder(prompts.to(z_0.device), contexts)
+
+        # Check for NaN in embeddings
+        if torch.isnan(emb_txt).any():
+            print("WARNING: NaN detected in text embeddings!")
+            emb_txt = torch.nan_to_num(emb_txt, nan=0.0)
+
+        cond = {'c_concat': [z_0], 'c_crossattn': [emb_txt]}
+
+        loss, loss_dict = self(z_1, cond)
+        
+        '''
+        if self.cond_stage_model is not None:
+            #c = self.get_learned_conditioning(prompts)
+            c = prompts
+        else:
+            c = None
+        
+        loss, loss_dict = self(x, c)
+        '''
+        
+        return loss, loss_dict
+
+    def training_step(self, batch, batch_idx):
+        loss, loss_dict = self.shared_step(batch)
+
+        self.log_dict(loss_dict, prog_bar=True,
+                      logger=True, on_step=True, on_epoch=True)
+
+        self.log("global_step", self.global_step,
+                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+        lr = self.optimizers().param_groups[0]['lr']
+        self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+
+        self._train_losses.append({k: v.item() for k, v in loss_dict.items()})
+
+        return loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        _, loss_dict = self.shared_step(batch)
+        self.log_dict(loss_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+
+        self._val_losses.append({k: v.item() for k, v in loss_dict.items()})
+
+    def to_rgb(self, x):
+        """Convert tensor to RGB format for visualization"""
+        x = (x + 1.0) / 2.0 * 255.0
+        x = x.to(torch.uint8)
+        return x
+
+    @torch.no_grad()
+    def sample_log(
+        self,
+        cond,
+        batch_size,
+        ddim_steps,
+        dims,
+        eta=0.0,
+    ):
+        sampler = DDIMSampler(self)
+        sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=eta, verbose=False)
+
+        ddim_start = torch.randn(batch_size, 4, dims, dims).to(self.device).to(self.dtype)
+
+        samples_ddim = sampler.decode(
+            ddim_start,
+            cond=cond,
+            t_start=ddim_steps - 1,
+        )
+
+        return samples_ddim
+        
+
+    @torch.no_grad()
+    def log_images(self, batch, N=16):
+        """Generate images for logging"""
+        log = dict()
+        
+        # Get prompts for unconditional generation
+        out = self.get_input(batch)
+        prompts = out[1]
+        
+        # Sample new images using DDIM
+        samples_ddim = self.sample_log(
+            cond=self.get_learned_conditioning(prompts[:N]),
+            batch_size=N,
+            ddim_steps=50,
+            dims=8,  # Assuming 8x8 latent dimensions for 64x64 images
+            eta=0.0
+        )
+        
+        # Decode samples to image space
+        x_samples_ddim = self.decode_first_stage(samples_ddim)
+        
+        log["samples"] = self.to_rgb(x_samples_ddim)
+        
+        return log
+
+    def _compute_validation_metrics(self, val_loader, prefix="val"):
+        """Compute FID, SSIM, PSNR on validation set"""
+        assert val_loader is not None
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
+        except ImportError:
+            print("Warning: torchmetrics not installed. Skipping metric computation.")
+            return
+        
+        import torch
+        import numpy as np
+        
+        # Initialize metrics
+        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(self.device)
+        ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        
+        print(f"\nComputing validation metrics...")
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                # Get real images
+                
+                cond_img, gt_img, Sentence_encoded, label = batch 
+                gt_img = gt_img.to(self.device).to(self.dtype)    
+                
+                get_input_out = self.get_input(batch)
+                z0, ehr_tok, z1, label = get_input_out[0], get_input_out[1], get_input_out[2], get_input_out[3]
+
+                emb_txt = self.text_encoder(ehr_tok.to(z0.device), self.model.diffusion_model.contexts) 
+                cond = {'c_concat': [z0], 'c_crossattn': [emb_txt]}
+                batch_size = cond_img.shape[0]
+
+                
+                
+                #x = batch[0]  # Unconditional Generation
+                #labels = batch[1]
+                #x = x.to(self.device).to(self.dtype)
+                
+                # Get input and prompts
+                #out = self.get_input(batch, return_first_stage_outputs=False)
+                #prompts = out[1]
+                #batch_size = x.shape[0]
+                
+                # Generate samples
+                samples_ddim = self.sample_log(
+                    cond=cond,
+                    batch_size=batch_size,
+                    ddim_steps=50,
+                    dims=8,
+                    eta=0.0
+                )
+                
+                # Decode to image space
+                generated = self.decode_first_stage(samples_ddim)
+                
+                # Normalize to [0, 1] for metrics
+                generated_norm = (generated + 1.0) / 2.0
+                gt_norm = (gt_img + 1.0) / 2.0
+                
+                # Clamp to valid range
+                generated_norm = torch.clamp(generated_norm, 0.0, 1.0)
+                gt_norm = torch.clamp(gt_norm, 0.0, 1.0)
+                
+                # For FID: convert grayscale to RGB if needed
+                if generated_norm.shape[1] == 1:
+                    generated_rgb = generated_norm.repeat(1, 3, 1, 1)
+                    gt_rgb = gt_norm.repeat(1, 3, 1, 1)
+                else:
+                    generated_rgb = generated_norm
+                    gt_rgb = gt_norm
+                
+                # Update FID
+                fid.update(gt_rgb, real=True)
+                fid.update(generated_rgb, real=False)
+                
+                # Update SSIM and PSNR
+                ssim.update(generated_norm, gt_norm)
+                psnr.update(generated_norm, gt_norm)
+                
+                #if batch_idx >= 50:  # Limit to ~50 batches for speed
+                #    break
+        
+        # Compute final metrics
+        try:
+            fid_score = fid.compute()
+            ssim_score = ssim.compute()
+            psnr_score = psnr.compute()
+            
+            # Log metrics
+            self.log(f'{prefix}/fid', fid_score, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'{prefix}/ssim', ssim_score, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'{prefix}/psnr', psnr_score, on_epoch=True, prog_bar=True, logger=True)
+            
+            print(f"{prefix} Metrics - FID: {fid_score:.4f}, SSIM: {ssim_score:.4f}, PSNR: {psnr_score:.4f}")
+        except Exception as e:
+            print(f"Error computing metrics: {e}")
+
+    def training_epoch_end(self, outputs) -> None:
+        print('call training epoch end')
+        torch.cuda.empty_cache()    
+    
+    
+    
+    def on_train_epoch_end(self):
+        """Log losses to CSV, print summary, and compute validation metrics"""
+        import csv
+
+        # --- CSV loss logging ---
+        if not self._csv_initialized:
+            self._init_csv()
+
+        def _avg(losses, key):
+            vals = [d[key] for d in losses if key in d]
+            return sum(vals) / len(vals) if vals else float('nan')
+
+        train_loss        = _avg(self._train_losses, 'train/loss')
+        train_loss_simple = _avg(self._train_losses, 'train/loss_simple')
+        train_loss_vlb    = _avg(self._train_losses, 'train/loss_vlb')
+        val_loss          = _avg(self._val_losses, 'val/loss')
+        val_loss_simple   = _avg(self._val_losses, 'val/loss_simple')
+        val_loss_vlb      = _avg(self._val_losses, 'val/loss_vlb')
+
+        lr = self.optimizers().param_groups[0]['lr']
+
+        with open(self._csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                self.current_epoch,
+                f"{train_loss:.6f}", f"{train_loss_simple:.6f}", f"{train_loss_vlb:.6f}",
+                f"{val_loss:.6f}", f"{val_loss_simple:.6f}", f"{val_loss_vlb:.6f}",
+                f"{lr:.8f}",
+            ])
+
+        print(f"\n[Epoch {self.current_epoch:>4d}]  "
+              f"train_loss={train_loss:.4f}  train_simple={train_loss_simple:.4f}  |  "
+              f"val_loss={val_loss:.4f}  val_simple={val_loss_simple:.4f}  |  "
+              f"lr={lr:.2e}")
+
+        self._train_losses.clear()
+        self._val_losses.clear()
+
+        # --- Validation image metrics ---
+        self.num_samples = 16
+        val_loader = self.trainer.val_dataloaders[0] if hasattr(self.trainer, 'val_dataloaders') else self.trainer.datamodule.val_dataloader()
+        train_loader = self.trainer.train_dataloader if hasattr(self.trainer, 'train_dataloader') else self.trainer.datamodule.train_dataloader()
+        test_loader = self.trainer.test_dataloader if hasattr(self.trainer, 'test_dataloader') else self.trainer.datamodule.test_dataloader()
+
+        if self.current_epoch % 5 == 0:
+            self._compute_validation_metrics(val_loader, prefix="val")
+        # if self.current_epoch % 10 == 0:
+        #     self._compute_validation_metrics(train_loader, prefix="train")
+        if self.current_epoch % 5 == 0:
+            self._compute_validation_metrics(test_loader, prefix="test")
+        
+        
+        '''
+        if self.current_epoch % 2 == 0:
+            # Get a batch from validation loader
+            if val_loader is not None:
+                batch = next(iter(val_loader))
+                log = self.log_images(batch, N=self.num_samples)
+                
+                # Log to wandb if available
+                if hasattr(self.trainer.logger, 'experiment') and self.trainer.logger.experiment is not None:
+                    import wandb
+                    import numpy as np
+                    if wandb.run is not None:
+                        # Convert tensors to numpy
+                        samples_np = log["samples"].cpu().numpy()
+                        
+                        # Find largest perfect square <= N
+                        import math
+                        max_samples = min(16, samples_np.shape[0])
+                        grid_size = int(math.sqrt(max_samples))
+                        num_samples = grid_size * grid_size
+                        
+                        # Create grid of generated samples
+                        sample_images = []
+                        
+                        for i in range(num_samples):
+                            # Convert from CHW to HWC for wandb
+                            if samples_np.shape[1] == 1:  # Grayscale
+                                sample_img = samples_np[i, 0]
+                            else:  # RGB
+                                sample_img = samples_np[i].transpose(1, 2, 0)
+                            
+                            sample_images.append(sample_img)
+                        
+                        # Create perfect square grid
+                        rows = []
+                        for row in range(grid_size):
+                            row_images = []
+                            for col in range(grid_size):
+                                idx = row * grid_size + col
+                                row_images.append(sample_images[idx])
+                            row_concat = np.concatenate(row_images, axis=1)
+                            rows.append(row_concat)
+                        
+                        grid_img = np.concatenate(rows, axis=0)
+                        
+                        wandb.log({
+                            "val/generated_samples": wandb.Image(grid_img, 
+                                caption=f"Generated samples ({num_samples} unconditional generations)")
+                        }, step=self.global_step)
+        '''

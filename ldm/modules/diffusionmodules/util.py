@@ -122,6 +122,12 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        # Save autocast state NOW (during forward, where it IS active)
+        ctx.gpu_autocast_kwargs = {
+            "enabled": torch.is_autocast_enabled(),
+            "dtype": torch.get_autocast_gpu_dtype(),
+            "cache_enabled": torch.is_autocast_cache_enabled(),
+        }
 
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
@@ -130,7 +136,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
+
+        with torch.enable_grad(), \
+             torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.
@@ -171,6 +179,29 @@ def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
     return embedding
 
 
+def spacecode_embedding(spacecodes, dim, max_period=10000, repeat_only=False):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    if not repeat_only:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=spacecodes.device)
+        args = spacecodes[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    else:
+        embedding = repeat(spacecodes, 'b -> b d', d=dim)
+    return embedding
+
+
 def zero_module(module):
     """
     Zero out the parameters of a module and return it.
@@ -202,7 +233,10 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    if channels == 16:
+        return GroupNorm32(16, channels)
+    else:
+        return GroupNorm32(32, channels)
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.

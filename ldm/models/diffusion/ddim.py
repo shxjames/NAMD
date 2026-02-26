@@ -5,8 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
-from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, \
-    extract_into_tensor
+from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
 
 
 class DDIMSampler(object):
@@ -80,7 +79,13 @@ class DDIMSampler(object):
                ):
         if conditioning is not None:
             if isinstance(conditioning, dict):
-                cbs = conditioning[list(conditioning.keys())[0]].shape[0]
+                # Get the first conditioning value
+                cond_val = conditioning[list(conditioning.keys())[0]]
+                # Handle list-wrapped tensors (e.g., c_concat: [tensor])
+                if isinstance(cond_val, list):
+                    cbs = cond_val[0].shape[0]
+                else:
+                    cbs = cond_val.shape[0]
                 if cbs != batch_size:
                     print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
             else:
@@ -173,7 +178,16 @@ class DDIMSampler(object):
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c])
+            if isinstance(c, dict):
+                c_in = {}
+                for k in c:
+                    if isinstance(c[k], list):
+                        c_in[k] = [torch.cat([unconditional_conditioning[k][i], c[k][i]])
+                                   for i in range(len(c[k]))]
+                    else:
+                        c_in[k] = torch.cat([unconditional_conditioning[k], c[k]])
+            else:
+                c_in = torch.cat([unconditional_conditioning, c])
             e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 

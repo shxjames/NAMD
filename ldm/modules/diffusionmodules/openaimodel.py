@@ -3,6 +3,8 @@ from functools import partial
 import math
 from typing import Iterable
 
+from einops import rearrange
+
 import numpy as np
 import torch as th
 import torch.nn as nn
@@ -19,13 +21,13 @@ from ldm.modules.diffusionmodules.util import (
 )
 from ldm.modules.attention import SpatialTransformer
 
-
 # dummy replace
 def convert_module_to_f16(x):
     pass
 
 def convert_module_to_f32(x):
     pass
+
 
 
 ## go
@@ -690,6 +692,11 @@ class UNetModel(nn.Module):
             conv_nd(dims, model_channels, n_embed, 1),
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
+
+        self.txt_embed_dim = 2560  # MedGemma 1.5 4B hidden dimension (was 3072 for Llama 3.2 3B)
+        self.context_length = 8
+        self.n_prompts = 2
+        self.contexts = nn.Parameter(th.randn(self.n_prompts, self.context_length, self.txt_embed_dim) * 0.02, requires_grad=True)
 
     def convert_to_fp16(self):
         """

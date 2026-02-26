@@ -1,0 +1,92 @@
+model:
+  base_learning_rate: 2.0e-05
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCond_LLM
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "jpg"
+    cond_stage_key: "txt"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false   # Note: different from the one we trained before
+    conditioning_key: hybrid
+    monitor: val/loss_simple_ema
+    scale_factor: YOUR_SCALE_FACTOR
+    use_ema: False
+    ckpt_path: YOUR_UNCONDITIONAL_UNET_CKPT
+    
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 8
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 2560  # MedGemma 1.5 4B hidden dimension (was 3072 for Llama 3.2 3B)
+        use_checkpoint: False
+        legacy: False
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 8
+    num_workers: 1
+    pin_memory: True
+    shuffle: True
+    ch: 3
+    prune: True
+    augment: True
+    rotate: True
+    angles: [45, 90, 135]
+    base_path: "NLST_with_second_large_cleaned"
+    model_type: "conditional"
+    construct_prompt: True
+
+trainer:
+  max_epochs: 200
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 2
+  log_every_n_steps: 5
+  # track_grad_norm: 2
+  deterministic: true
+
