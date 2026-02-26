@@ -93,6 +93,7 @@ python eval_all.py \
 
 Results are saved to `results/<project>/eval_all_<guidance>.json`.
 
+For reproducibility, we also provide the pretrained ViT checkpoint used for evaluation in ```checkpoints/vit/42.pth```.
 ---
 
 ## Ablation Study
