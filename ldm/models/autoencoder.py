@@ -440,6 +440,16 @@ class AutoencoderKL(pl.LightningModule):
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
 
+class AutoencoderKLCustom(AutoencoderKL):
+    """AutoencoderKL compatible with (img, feature, label) tuple batches.
+    Extracts only the image for reconstruction; feature and label are ignored.
+    """
+    @torch.no_grad()
+    def get_input(self, batch):
+        img, feature, label = batch
+        img = img.to(memory_format=torch.contiguous_format).to(dtype=self.dtype)
+        img = img.to(self.device)
+        return img
 
 class IdentityFirstStage(torch.nn.Module):
     def __init__(self, *args, vq_interface=False, **kwargs):

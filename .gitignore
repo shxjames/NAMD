@@ -214,3 +214,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset
+DLCS_patches/
+Luna16_patches/
+Luna25_nodule_2D_Checked/
+NLST_with_second_large_cleaned/
+
+logs/
+checkpoints/
+*.ckpt
+
+# Packages
+taming/

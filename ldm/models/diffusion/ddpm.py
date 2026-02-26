@@ -26,6 +26,10 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+##### For LLM
+from ldm.text_encoder import TextContextEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor   ### For Llama 3 or MedGemma
+
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -2056,6 +2060,41 @@ class LatentDiffusionCond_LLM(LatentDiffusion):
         self._train_losses = []
         self._val_losses = []
         self._csv_initialized = False
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+        
+        sd_dict = sd['state_dict']
+        model_dict = self.model.state_dict()
+ 
+        for name, weight in sd_dict.items():
+            for name_model, weigh_model in model_dict.items():
+                if name.endswith(name_model):
+                    if model_dict[name_model].shape != weight.shape:
+                        ignore_keys.append(name)
+                        names_no_dot = name.replace(".", "")  ### Remove model_ema.
+                        names_no_dot = 'model_ema.' + names_no_dot[5:]
+                        ignore_keys.append(names_no_dot)
+
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+
+        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+            sd, strict=False)
+        
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected Keys: {unexpected}")
 
     def _init_csv(self):
         """Initialize CSV loss log file with header."""
