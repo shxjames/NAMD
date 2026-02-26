@@ -6,6 +6,23 @@
 
 ## Training and Testing NAMD
 
+### Downloading the Dataset
+Due to data-sharing regulations, we cannot directly distribute the datasets in this repository. You can download them from:
+
+- [NLST](https://www.cancerimagingarchive.net/collection/nlst/)
+- [DLCS](https://zenodo.org/records/13799069)
+- [LUNA25](https://luna25.grand-challenge.org/)
+- [LUNA16](https://luna16.grand-challenge.org/)
+
+Place the downloaded datasets in the following folders:
+
+- `NLST_with_second_large_cleaned`
+- `Luna25_nodule_2D_Checked`
+- `DLCS_patches`
+- `Luna16_patches`
+
+Note that NLST is the only one with paired images. The others are unpaired images and do not provide the level of patient/nodule features that NLST has; hence, those images are used to only train the unconditional unet prior. NLST is used to train the conditional model. 
+
 ### Step 1 &mdash; Download SD 1.5 Pretrained Weights
 
 Download the SD 1.5 checkpoint into `preprocess/`:
