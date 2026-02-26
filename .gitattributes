@@ -1,1 +1,0 @@
-checkpoints/vit/42.pth filter=lfs diff=lfs merge=lfs -text
