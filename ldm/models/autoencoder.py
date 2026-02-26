@@ -260,7 +260,7 @@ class VQModel(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
-   
+
 
 class VQModelInterface(VQModel):
     def __init__(self, embed_dim, *args, **kwargs):

@@ -19,8 +19,7 @@ from ldm.modules.diffusionmodules.util import (
     normalization,
     timestep_embedding,
 )
-from ldm.modules.attention import SpatialTransformer, CrossAttention
-
+from ldm.modules.attention import SpatialTransformer
 
 # dummy replace
 def convert_module_to_f16(x):
@@ -30,8 +29,7 @@ def convert_module_to_f32(x):
     pass
 
 
-def exists(x):
-    return x is not None
+
 ## go
 class AttentionPool2d(nn.Module):
     """
