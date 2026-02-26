@@ -162,8 +162,8 @@ class Demographic_Features:
         #else:
         #    sentence = sentence + 'is present in the the other side of lung.'
 
-        if ehr_2 is not None:
-            sentence = sentence + ' One year later, the size of nodule will become ' + str(get_val(ehr_2[2]) * scale_factor) + ' mm.'
+        # if ehr_2 is not None:
+        #     sentence = sentence + ' One year later, the size of nodule will become ' + str(get_val(ehr_2[2]) * scale_factor) + ' mm.'
 
         return sentence
 
@@ -959,8 +959,3 @@ class Lung_DM(pl.LightningDataModule):
 def Lung_Pair_DM(**kwargs):
     return Lung_DM(dataset_class=Lung_Pair_DS, **kwargs)
 
-def Lung_Nodule_DM(**kwargs):
-    return Lung_DM(dataset_class=Lung_Nodule_DS, **kwargs)
-
-def Lung_Unconditional_DM(**kwargs):
-    return Lung_DM(dataset_class=Lung_Unconditional_DS, **kwargs)

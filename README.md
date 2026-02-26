@@ -30,7 +30,7 @@ python preprocess/preprocess.py \
 Fine-tune the autoencoder on the lung nodule dataset:
 
 ```bash
-python run.py --config configs/autoencoder/contrastive-VAE.yaml --train
+python run.py --config configs/autoencoder/contrastive-VAE.yaml --train --project autoencoder
 ```
 
 Checkpoints are saved under `checkpoints/`.
@@ -58,7 +58,7 @@ Also set `ckpt_path` under `first_stage_config` in both configs to your trained 
 ### Step 4 &mdash; Train the Unconditional Diffusion Model
 
 ```bash
-python run.py --config configs/ldm/v1.5-unconditional-unet.yaml --train
+python run.py --config configs/ldm/v1.5-unconditional-unet.yaml --train --project v1.5-unconditional
 ```
 
 ---
@@ -68,7 +68,7 @@ python run.py --config configs/ldm/v1.5-unconditional-unet.yaml --train
 Set `ckpt_path` in `configs/ldm/v1.5-conditional-unet-llm.yaml` to the unconditional checkpoint from Step 4, then run:
 
 ```bash
-python run.py --config configs/ldm/v1.5-conditional-unet-llm.yaml --train
+python run.py --config configs/ldm/v1.5-conditional-unet-llm.yaml --train --project v1.5-conditional
 ```
 
 ---
