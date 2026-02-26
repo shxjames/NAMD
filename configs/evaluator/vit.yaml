@@ -10,7 +10,7 @@ model:
     mlp_dim: 2048
     dropout: 0.5
     emb_dropout: 0.5
-    ckpt_path: YOUR_VIT_CKPT
+    ckpt_path: checkpoints/vit/42.pth
 
 data:
   target: dataset.Lung_Pair_DM
