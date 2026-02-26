@@ -3,7 +3,7 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 from contextlib import contextmanager
 
-from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
+from taming.modules.vqvae.quantize import VectorQuantizer as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
@@ -38,7 +38,8 @@ class VQModel(pl.LightningModule):
         self.loss = instantiate_from_config(lossconfig)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25,
                                         remap=remap,
-                                        sane_index_shape=sane_index_shape)
+                                        sane_index_shape=sane_index_shape
+                                        )
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         if colorize_nlabels is not None:
@@ -259,7 +260,7 @@ class VQModel(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
-
+   
 
 class VQModelInterface(VQModel):
     def __init__(self, embed_dim, *args, **kwargs):
@@ -310,16 +311,33 @@ class AutoencoderKL(pl.LightningModule):
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+    def init_from_ckpt(self, path, ignore_keys=None):
+        if ignore_keys is None:
+            ignore_keys = []
+        
+        # Check if it's a SafeTensors file
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            sd = load_file(path)
+        else:
+            # Load PyTorch checkpoint
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            # Handle both raw state dict and wrapped checkpoint formats
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                sd = checkpoint["state_dict"]
+            else:
+                sd = checkpoint
+        
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
                     print("Deleting key {} from state_dict.".format(k))
                     del sd[k]
-        self.load_state_dict(sd, strict=False)
-        print(f"Restored from {path}")
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        print(f"Missing Keys: {missing}")
+        print(f"Unexpected Keys: {unexpected}")
 
     def encode(self, x):
         h = self.encoder(x)
