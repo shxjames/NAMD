@@ -1,0 +1,84 @@
+model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.corrae.ContrastiveAutoencoderKL
+  params:
+    embed_dim: 4
+    num_classes: 1
+    monitor: val/total_loss
+    # ckpt_path: preprocess/v1-5-autokl.ckpt
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 64
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult:
+      - 1
+      - 2
+      - 4
+      - 4
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.2
+      tanh_out: true
+    lossconfig:
+      target: ldm.modules.losses.contperceptual.LPIPSWithDiscriminator
+      params:
+        disc_start: 10000
+        kl_weight: 1.0e-06
+        disc_weight: 0.0
+        use_nll_loss: false
+    contrastiveconfig:
+      target: ldm.modules.losses.kl_distance_loss.KLDistanceLoss
+      params:
+        feature_sigma: 4.0
+        latent_sigma: 1.0
+        temperature: 0.5
+        eps: 1.0e-08
+        num_channels: 4
+        proj_mode: pooling
+        distance_type: rbf
+    hidden_dim: 256
+    weight_decay: 0.01
+    feature_loss_weight: 0.0
+    label_loss_weight: 0.0
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 16
+    num_workers: 1
+    pin_memory: true
+    augment: true
+    shuffle: true
+    ch: 3
+    rotate: true
+    angles:
+    - 45
+    - 90
+    - 135
+    - 180
+    base_path: NLST_with_second_large_cleaned
+    has_Luna25: true
+    has_DLCS: true
+    has_Luna16: true
+    use_feature_grouped_sampler: true
+    model_type: autoencoder
+    selected_features:
+    - SCT_PRE_ATT
+    - SCT_EPI_LOC
+    - SCT_LONG_DIA
+    - SCT_PERP_DIA
+    - SCT_MARGINS
+
+trainer:
+  max_epochs: 200
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  deterministic: true
