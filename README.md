@@ -107,41 +107,6 @@ To train the autoencoder from scratch (without SD 1.5 initialization), comment o
 
 ---
 
-## Directory Structure
-
-```
-.
-├── ldm/
-│   ├── models/
-│   │   ├── autoencoder.py
-│   │   ├── diffusion/
-│   │   └── ehr.py
-│   ├── modules/
-│   │   ├── attention.py
-│   │   ├── diffusionmodules/
-│   │   ├── distributions/
-│   │   ├── encoders/
-│   │   ├── image_degradation/
-│   │   ├── losses/
-│   │   └── spade.py
-│   ├── environment.yaml
-│   ├── lr_scheduler.py
-│   └── util.py
-├── preprocess/               # SD 1.5 weights and extraction script
-├── configs/
-│   ├── autoencoder/          # Autoencoder configurations
-│   ├── evaluator/            # ViT evaluator configuration
-│   └── ldm/                  # LDM configurations
-├── checkpoints/              # Model checkpoints
-├── logs/                     # Training logs
-├── dataset.py                # Dataset loading utilities
-├── run.py                    # Main training script
-├── eval_autoencoder.py       # Scale factor computation
-└── eval_all.py               # Multi-seed evaluation
-```
-
----
-
 ## Data Format
 
 Place your dataset under `NLST_with_second_large_cleaned/`. Each `.npy` file contains a `32×1` array — the first 16 entries represent the first-year LDCT scan and the last 16 the second-year LDCT scan.
@@ -166,3 +131,4 @@ Place your dataset under `NLST_with_second_large_cleaned/`. Each `.npy` file con
 | `famsister` | Family history — Sister |
 | `famchild` | Family history — Child |
 | `can_scr` | Malignancy label (B/M) — not a feature |
+
