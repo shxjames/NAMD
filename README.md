@@ -1,6 +1,6 @@
 # NAMD: Nodule-Aware Multimodal Diffusion
 
-> Nodule-Aligned Latent Space Learning with LLM-Driven Multimodal Diffusion for Longitudinal Lung LDCT Prediction
+> Nodule-Aligned Latent Space Learning with LLM-Driven Multimodal Diffusion for Lung Nodule Progression Prediction
 
 ---
 
@@ -153,4 +153,5 @@ Place your dataset under `NLST_with_second_large_cleaned/`. Each `.npy` file con
 | `famsister` | Family history — Sister |
 | `famchild` | Family history — Child |
 | `can_scr` | Malignancy label (B/M) — not a feature |
+
 
