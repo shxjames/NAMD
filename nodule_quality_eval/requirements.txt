@@ -1,0 +1,35 @@
+# Core scientific stack
+numpy>=2.0.1
+scipy
+scikit-image
+SimpleITK>=2.4.0
+huggingface_hub
+Pillow
+pandas
+
+# PyTorch (install a matching CUDA build separately if you want GPU)
+torch
+torchvision
+
+# PyRadiomics: install from GitHub master, because the PyPI version
+# does not ship cp310+ win_amd64 wheels and the source build needs
+# Microsoft C++ Build Tools.
+#
+#   python -m pip install git+https://github.com/AIM-Harvard/pyradiomics.git
+#
+# If you cannot install PyRadiomics, pass `--metrics-backend skimage` to
+# run_evaluation.py to use the lightweight skimage-only feature extractor
+# (first-order + GLCM, no IBSI panel).
+# ------------------------------------------------------------------
+# MedSAM 2 setup (not pip-installable directly — clone the repo):
+#
+#   git clone https://github.com/bowang-lab/MedSAM2.git
+#   cd MedSAM2
+#   pip install -e ".[dev]"
+#
+# The MedSAM 2 checkpoint (~750 MB) is auto-downloaded from HuggingFace
+# on first run:
+#   repo_id  = "wanglab/MedSAM2"
+#   filename = "MedSAM2_latest.pt"
+# cached under ./checkpoints/
+# ------------------------------------------------------------------
