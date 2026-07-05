@@ -1,6 +1,6 @@
-# NAMD: Nodule-Aware Multimodal Diffusion
+# NAMD: Nodule-Aligned Multimodal Diffusion
 
-> Nodule-Aligned Latent Space Learning with LLM-Driven Multimodal Diffusion for Lung Nodule Progression Prediction
+> Virtual Follow-up Computed Tomography Synthesis via Nodule-Aligned Multimodal Diffusion Models for Early Lung Cancer Diagnosis
 
 ---
 
