@@ -1,0 +1,111 @@
+# SD2.1-base backbone, unconditional stage. Mirrors v1.5-unconditional-unet.yaml;
+# deltas: init ckpt, sd21.* targets, num_head_channels 64 (not num_heads 8),
+# use_linear_in_transformer, context_dim 1024, OpenCLIP-H text tower.
+# context_length/n_prompts pinned to 0/1 so the checkpoint feeds the
+# conditional arm without soft-prompt keys to drop.
+model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCustom
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "jpg"
+    cond_stage_key: "txt"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: crossattn
+    monitor: val/loss
+    use_ema: False
+    conditioning_mode: clip
+    ckpt_path: preprocess/v2-1_512-ema-pruned.ckpt
+    ignore_keys: ["first_stage_model", "model_ema", "cond_stage_model"]
+    scale_factor: YOUR_SCALE_FACTOR
+
+    scheduler_config: # 10000 warmup steps
+      target: ldm.lr_scheduler.LambdaWarmUpCosineScheduler2
+      params:
+        warm_up_steps: [ 4000 ]
+        cycle_lengths: [ 100000 ] # incredibly large number to prevent corner cases
+        f_start: [ 0.01 ]
+        f_max: [ 1. ]
+        f_min: [ 0.1 ]
+
+    unet_config:
+      target: sd21.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        use_checkpoint: True
+        legacy: False
+        context_length: 0
+        n_prompts: 1
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        ckpt_path: YOUR_PATH_TO_AE_CKPT
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+      hidden_dim: 256
+
+    cond_stage_config:
+      target: sd21.encoders.FrozenOpenCLIPHFEmbedder
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 16
+    num_workers: 4
+    pin_memory: True
+    shuffle: True
+    ch: 3
+    augment: True
+    rotate: True
+    angles: [45, 90, 135, 180]
+    has_Luna25: true
+    has_DLCS: true
+    has_Luna16: true
+    model_type: "unconditional"
+    base_path: "NLST_with_second_large_cleaned"
+
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  deterministic: true
