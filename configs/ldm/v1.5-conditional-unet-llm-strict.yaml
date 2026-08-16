@@ -1,0 +1,127 @@
+# NAMD stage 2: conditional, initialised exactly from the stage-1 MedGemma
+# unconditional checkpoint (configs/ldm/v1.5-unconditional-unet-medgemma.yaml).
+#
+# strict_load: true means nothing is silently dropped. Every tensor must line up,
+# with one deliberate exception: input_blocks.0.0.weight goes 4 -> 8 channels for
+# the prior-year concat, so the trained 4 channels are copied and the concat half
+# is zero-filled. That leaves stage 2 function-identical to stage 1 at step 0.
+#
+# ckpt_path must be set at launch, e.g.
+#   --set model.params.ckpt_path=checkpoints/<stage1-project>/last.ckpt
+model:
+  base_learning_rate: 2.0e-05
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCond_LLM
+  params:
+    linear_start: 0.00085
+    linear_end: 0.012
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: jpg
+    cond_stage_key: txt
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: hybrid
+    monitor: val/loss
+    use_ema: false
+
+    llm_model: google/medgemma-1.5-4b-it
+    llm_load_in_4bit: True
+    strict_load: True
+    expand_concat_channels: True
+    # cond_stage_config is deliberately absent. The FrozenCLIPEmbedder this class
+    # used to build was never read (shared_step conditions through
+    # self.text_encoder); it only added ~123M frozen params to every checkpoint
+    # and blocked an exact load.
+
+    # Must match the stage-1 value exactly -- scale_factor is a config value, not
+    # a state_dict entry, so a strict load will not catch a mismatch.
+    scale_factor: 0.379953
+
+    ckpt_path: YOUR_STAGE1_CKPT
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32
+        in_channels: 8      # 4 noise + 4 prior-year concat
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions:
+        - 4
+        - 2
+        - 1
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 4
+        - 4
+        num_heads: 8
+        use_spatial_transformer: true
+        transformer_depth: 1
+        context_dim: 2560
+        use_checkpoint: false
+        legacy: false
+        context_length: 8
+        n_prompts: 2
+        txt_embed_dim: 2560
+
+    # No ckpt_path: the VAE arrives from the stage-1 checkpoint, which guarantees
+    # it is the one stage 1 actually trained against. ddconfig must stay identical
+    # to stage 1 or the strict load fails.
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 8
+    num_workers: 1
+    pin_memory: true
+    shuffle: true
+    ch: 3
+    prune: true
+    augment: true
+    rotate: true
+    angles:
+    - 45
+    - 90
+    - 135
+    base_path: NLST_with_second_large_cleaned
+    model_type: conditional
+    construct_prompt: true
+
+trainer:
+  max_epochs: 65
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  track_grad_norm: 2
+  deterministic: true

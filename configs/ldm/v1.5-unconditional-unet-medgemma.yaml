@@ -1,0 +1,133 @@
+# NAMD stage 1: unconditional pretraining on the MedGemma empty prompt.
+#
+# Conditioning is MedGemma([BOS] + soft_prompts + [EOS]) -- an empty prompt, so
+# the context is constant across every sample. Replaces the previous CLIP-null
+# stage 1, whose 768-d context forced stage 2 to drop and randomly re-initialise
+# all 32 attn2.to_k/to_v matrices plus `contexts`.
+#
+# unet_config must stay identical to the stage-2 config except for in_channels
+# (4 here, 8 there for the prior-year concat). Stage 2 loads this checkpoint with
+# strict_load: true, which fails loudly on any other divergence.
+model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCustom
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "jpg"
+    cond_stage_key: "txt"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: crossattn
+    monitor: val/loss
+    use_ema: False
+
+    conditioning_mode: llm
+    llm_model: google/medgemma-1.5-4b-it
+    llm_load_in_4bit: True
+    # Soft prompts are model.diffusion_model.contexts -- the same tensor, under
+    # the same state_dict key, that stage 2 trains. Training them here pretrains
+    # the whole conditioning pathway as a unit; it is a learned bias rather than
+    # a discriminative signal, since the prompt is constant.
+    train_contexts: True
+    # cond_stage_config is deliberately absent: MedGemma is the text encoder, and
+    # '__is_unconditional__' would null conditioning_key and kill cross-attention.
+
+    # SD1.5 init. cond_stage_model is dropped because there is no CLIP tower any
+    # more. The 32 attn2.to_k/to_v are 768-d in SD1.5 and 2560-d here, so they
+    # are re-initialised at this stage -- which is the point: they get pretrained
+    # on the pooled Luna25 + DLCS + Luna16 + NLST set and then transfer to stage 2.
+    ckpt_path: preprocess/v1-5-pruned.ckpt
+    ignore_keys: ["first_stage_model", "model_ema", "cond_stage_model"]
+
+    # PRED-VAE (checkpoints/vae-abl-pred-full-bs32-lr2.0e-05-s23/epoch=08-val),
+    # per eval_autoencoder.py. Stage 2 must use this same number.
+    scale_factor: 0.379953
+
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaWarmUpCosineScheduler2
+      params:
+        warm_up_steps: [ 4000 ]
+        # The template's 100000 is reachable (2983 steps/epoch x 50 epochs =
+        # 149k) and LambdaWarmUpCosineScheduler2 crashes past the last cycle.
+        cycle_lengths: [ 10000000000 ]
+        f_start: [ 0.01 ]
+        f_max: [ 1. ]
+        f_min: [ 0.1 ]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 4      # stage 2 uses 8; its loader zero-pads the concat half
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 2560         # MedGemma 1.5 4B hidden dim
+        use_checkpoint: True
+        legacy: False
+        context_length: 8         # soft-prompt length
+        n_prompts: 2              # parallel soft prompts
+        txt_embed_dim: 2560
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        ckpt_path: checkpoints/vae-abl-pred-full-bs32-lr2.0e-05-s23/epoch=08-val/total_loss=0.212.ckpt
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 16
+    num_workers: 4
+    pin_memory: True
+    shuffle: True
+    ch: 3
+    augment: True
+    rotate: True
+    angles: [45, 90, 135, 180]
+    has_Luna25: true
+    has_DLCS: true
+    has_Luna16: true
+    model_type: "unconditional"
+    base_path: "NLST_with_second_large_cleaned"
+
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  deterministic: true
