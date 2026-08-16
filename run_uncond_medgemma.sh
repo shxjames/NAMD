@@ -29,7 +29,9 @@ source ~/anaconda3/etc/profile.d/conda.sh
 module load cuda
 conda activate /scratch/liyues_root/liyues/shxjames/envs/NAMD
 
-cd /scratch/liyues_root/liyues/shxjames/NAMD
+# Run from wherever sbatch was invoked, so the same script works from the main
+# checkout or from a side checkout on a feature branch.
+cd "${SLURM_SUBMIT_DIR:-/scratch/liyues_root/liyues/shxjames/NAMD}"
 
 LR=${LR:-1e-4}
 BS=${BS:-16}
