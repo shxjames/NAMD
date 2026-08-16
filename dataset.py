@@ -85,10 +85,31 @@ class Demographic_Features:
             )
 
         token_ids = retriever.tokenizer.encode(sentence)
-        if len(token_ids) > target_length:
-            token_ids = (
-                token_ids[:target_length - 1] + [retriever.tokenizer.tokenizer.vocab_size]
-            )
+
+        # Terminate the prompt with the tokenizer's EOS.
+        #
+        # TextContextEncoder pools the LLM hidden state at the last non-padding
+        # position (ldm/text_encoder.py:73). That rule comes from CLIP, whose
+        # tokenizer appends <|endoftext|> itself, so the pooled position is a real
+        # sentence-terminator. Gemma's tokenizer has add_eos_token=False, so
+        # encode() returns [BOS, ...tokens] with no terminator and the MedGemma arm
+        # was pooling at the sentence's final '.' instead.
+        #
+        # No-op for the arms whose tokenizer already terminates: CLIP ends in
+        # <|endoftext|>, and CXR-BERT (CT-CLIP) reports eos_token_id is None while
+        # already ending in [SEP]. getattr because TokenizerShim
+        # (ldm/modules/encoders/ctclip_encoder.py:6) exposes only .encode() and
+        # .tokenizer.vocab_size.
+        #
+        # This also supersedes the old over-length marker, which read
+        # retriever.tokenizer.tokenizer.vocab_size -- an attribute a raw
+        # AutoTokenizer does not have. It never raised only because these prompts
+        # run 36-54 tokens against a 120-slot cap.
+        eos = getattr(retriever.tokenizer, "eos_token_id", None)
+        if eos is not None and token_ids[-1] != eos:
+            token_ids = token_ids[:target_length - 1] + [eos]
+        elif len(token_ids) > target_length:
+            token_ids = token_ids[:target_length]
 
         encoded = torch.tensor(token_ids, dtype=torch.long)
         pad_length = max(0, target_length - encoded.shape[0])
