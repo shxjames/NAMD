@@ -1403,13 +1403,137 @@ class LatentDiffusion(DDPM):
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
 
-class LatentDiffusionCustom(LatentDiffusion):
+# ---------------------------------------------------------------------------
+# Shared MedGemma text pathway (used by both NAMD training stages)
+# ---------------------------------------------------------------------------
+# Stage 1, unconditional -- LatentDiffusionCustom with conditioning_mode='llm':
+#     context = MedGemma([BOS] + soft_prompts + [EOS])          <- empty prompt
+# Stage 2, conditional -- LatentDiffusionCond_LLM:
+#     context = MedGemma([BOS] + soft_prompts + EHR + [EOS])
+#
+# Both stages run the same frozen encoder, the same soft-prompt tensor
+# (model.diffusion_model.contexts) and the same 2560-d cross-attention context,
+# so every UNet weight transfers from stage 1 to stage 2 -- including the 32
+# attn2.to_k/to_v matrices. The old CLIP-conditioned stage 1 produced 768-d
+# context, which forced stage 2 to drop and randomly re-initialise all of them.
+
+
+def build_medgemma_text_encoder(txt_embed_dim,
+                                llm_model="google/medgemma-1.5-4b-it",
+                                llm_load_in_4bit=False):
+    """Frozen MedGemma text encoder plus its tokenizer.
+
+    Lifted out of LatentDiffusionCond_LLM so both stages build byte-identical
+    modules: same <SEG> token, same resized embedding table, same compute dtype.
+    Drift between the two constructions silently breaks the weight transfer.
+
+    Returns (text_encoder, tokenizer, token_embed_dim).
+    """
+    # MedGemma 1.5 4B has hidden_dim = 2560; Llama 3.2 3B has 3072.
+    text_encoder = TextContextEncoder(embed_dim=txt_embed_dim)
+    token_embed_dim = text_encoder.text_projection.shape[-1]
+    for _, param in text_encoder.named_parameters():
+        param.requires_grad_(False)
+
+    text_encoder.llm = True
+    text_encoder.llm_type = 'medgemma'
+
+    # AutoTokenizer (not AutoProcessor): MedGemma is multimodal but only the
+    # text/language half is used here.
+    tokenizer = AutoTokenizer.from_pretrained(llm_model)
+
+    # Default is bf16 (no quantization): on a large-VRAM GPU that is both faster
+    # and higher fidelity for a frozen text encoder. llm_load_in_4bit: true uses
+    # bitsandbytes nf4 instead, which needs CUDA.
+    if llm_load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            llm_full = AutoModelForCausalLM.from_pretrained(
+                llm_model,
+                quantization_config=quantization_config,
+                device_map="auto",  # auto placement for the quantized model
+            )
+            print("Loaded MedGemma with 4-bit quantization")
+        except ImportError:
+            print("bitsandbytes not installed, loading in bf16 without quantization")
+            llm_full = AutoModelForCausalLM.from_pretrained(
+                llm_model, torch_dtype=torch.bfloat16, device_map="cpu")
+    else:
+        llm_full = AutoModelForCausalLM.from_pretrained(
+            llm_model, torch_dtype=torch.bfloat16, device_map="cpu")
+        print("Loaded MedGemma in bf16 (no quantization)")
+
+    tokenizer._add_tokens(["<SEG>"], special_tokens=True)
+    llm_full.resize_token_embeddings(len(tokenizer) + 1)
+
+    # Multimodal MedGemma: llm_full.language_model IS the Gemma3TextModel.
+    # Text-only Gemma: llm_full.model is.
+    if hasattr(llm_full, 'language_model'):
+        text_encoder.transformer = llm_full.language_model
+        text_encoder.token_embedding = llm_full.language_model.embed_tokens
+    else:
+        text_encoder.transformer = llm_full.model
+        text_encoder.token_embedding = llm_full.model.embed_tokens
+
+    for _, param in text_encoder.transformer.named_parameters():
+        param.requires_grad_(False)
+
+    # Both load paths run bf16 compute (full bf16 weights, or nf4 with bf16
+    # compute), so the frozen forward is bf16 regardless of quantization.
+    text_encoder.llm_compute_dtype = torch.bfloat16
+    return text_encoder, tokenizer, token_embed_dim
+
+
+class FrozenTextEncoderCheckpointMixin:
+    """Keep the frozen MedGemma weights out of saved checkpoints.
+
+    MedGemma adds ~3.5 GB to every state_dict (nf4 blocks plus the unquantised
+    262k x 2560 embedding table, which bitsandbytes leaves in bf16) and is
+    identical on every reload, so persisting it is pure cost -- it is what makes
+    a conditional last.ckpt 14.7 GB against the unconditional 11.1 GB. Adding
+    MedGemma to stage 1 would repeat that for every stage-1 checkpoint too.
+
+    on_load_checkpoint restores the live weights before Lightning's strict resume
+    runs, so --resume still works, and checkpoints written before this change
+    (which do carry the weights) keep loading unchanged.
+    """
+
+    save_text_encoder = False
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.save_text_encoder:
+            return
+        sd = checkpoint.get("state_dict")
+        if sd is None:
+            return
+        for k in [k for k in sd if k.startswith("text_encoder.")]:
+            del sd[k]
+
+    def on_load_checkpoint(self, checkpoint):
+        sd = checkpoint.get("state_dict")
+        if sd is None or not hasattr(self, "text_encoder"):
+            return
+        for k, v in self.state_dict().items():
+            if k.startswith("text_encoder.") and k not in sd:
+                sd[k] = v
+
+
+class LatentDiffusionCustom(FrozenTextEncoderCheckpointMixin, LatentDiffusion):
     def __init__(self,
                  first_stage_config=None,
                  cond_stage_config="__is_unconditional__",
                  shift_factor=0.0,
                  conditioning_mode='clip',
-                 llm_config=None,
+                 llm_model="google/medgemma-1.5-4b-it",
+                 llm_load_in_4bit=False,
+                 train_contexts=True,
+                 save_text_encoder=False,
                  ckpt_path=None,
                  ignore_keys=list(),
                  *args, **kwargs):
@@ -1422,25 +1546,43 @@ class LatentDiffusionCustom(LatentDiffusion):
             # Set scale_factor to 1.0 for pixel space
             kwargs['scale_factor'] = kwargs.get('scale_factor', 1.0)
 
+        assert conditioning_mode in ('clip', 'llm'), \
+            f"conditioning_mode must be 'clip' or 'llm', got '{conditioning_mode}'"
+
+        if conditioning_mode == 'llm':
+            # MedGemma owns the text pathway, so there is no CLIP cond stage to
+            # build. '__is_unconditional__' is NOT usable here: LatentDiffusion
+            # rewrites conditioning_key to None for it (see its __init__), which
+            # would drop cross-attention entirely and leave the soft prompts
+            # unread. A parameter-free Identity keeps conditioning_key='crossattn'
+            # and contributes no state_dict keys.
+            if cond_stage_config not in (None, "__is_unconditional__"):
+                print(f"{self.__class__.__name__}: conditioning_mode='llm' ignores "
+                      f"cond_stage_config={cond_stage_config!r} (MedGemma is the text encoder)")
+            cond_stage_config = {"target": "torch.nn.Identity"}
+
         super().__init__(first_stage_config, cond_stage_config, *args, **kwargs)
 
         self.shift_factor = shift_factor
-        assert conditioning_mode in ('clip', 'llm'), \
-            f"conditioning_mode must be 'clip' or 'llm', got '{conditioning_mode}'"
         self.conditioning_mode = conditioning_mode
-        self._null_llm_emb = None  # cached null embedding (eval only) for llm mode
-
-        self.use_llm = llm_config is not None
-        if self.use_llm:
-            self._init_llm_encoder(llm_config)
+        self.save_text_encoder = save_text_encoder
+        self.use_llm = conditioning_mode == 'llm'
+        self._null_llm_emb = None          # cached empty-prompt embedding
+        self._null_llm_emb_device = None
 
         if self.pixel_space:
             # Override first_stage_model with None for pixel space
             self.first_stage_model = None
             print(f"{self.__class__.__name__}: Running in pixel space mode (no VAE)")
 
+        # Load the init checkpoint before MedGemma is attached, so the huge frozen
+        # text-encoder keys never take part in the load. LatentDiffusionCond_LLM
+        # has the same ordering (its super().__init__ runs init_from_ckpt first).
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys)
+
+        if self.use_llm:
+            self._init_llm_encoder(llm_model, llm_load_in_4bit, train_contexts)
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         sd = torch.load(path, map_location="cpu", weights_only=False)
@@ -1465,6 +1607,11 @@ class LatentDiffusionCustom(LatentDiffusion):
             del sd[k]
 
         missing, unexpected = self.load_state_dict(sd, strict=False)
+        # Checkpoints are written without the frozen text encoder (see
+        # FrozenTextEncoderCheckpointMixin); it is rebuilt from HF every run, so
+        # its absence is expected and would otherwise bury the real report.
+        missing = [k for k in missing if not k.startswith("text_encoder.")]
+        unexpected = [k for k in unexpected if not k.startswith("text_encoder.")]
         print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
         if len(missing) > 0:
             print(f"Missing Keys: {missing}")
@@ -1472,26 +1619,83 @@ class LatentDiffusionCustom(LatentDiffusion):
             print(f"Unexpected Keys: {unexpected}")
 
 
-    def _init_llm_encoder(self, llm_config):
-        """Frozen LLM transformer + learnable context tokens and SEG embedding."""
-        self.llm_config = llm_config
+    def _init_llm_encoder(self, llm_model, llm_load_in_4bit, train_contexts):
+        """Attach the frozen MedGemma encoder that embeds the empty prompt.
 
-        self.contexts = nn.Parameter(
-            llm_config.get_contexts(), requires_grad=True
-        )
+        The learnable soft prompts are the UNet's own `contexts` parameter, i.e.
+        model.diffusion_model.contexts -- the same tensor under the same
+        state_dict key that LatentDiffusionCond_LLM trains -- so they carry over
+        to stage 2 directly rather than being re-initialised there.
+        """
+        unet = self.model.diffusion_model
+        self.txt_embed_dim = unet.txt_embed_dim
+        self.context_length = unet.context_length
+        self.n_prompts = unet.n_prompts
+        # Retriever protocol (run.py calls dm.set_retriever(model)). The stage-1
+        # dataset runs model_type='unconditional' and never builds prompts, so
+        # this is only here to keep the protocol satisfied.
+        self.max_length = 128
 
-    def get_llm_embeddings(self, encoded_sentences):
-        """Run frozen LLM with learnable context/SEG → (B, P, embed_dim)."""
-        if not self.use_llm:
-            return None
+        # The cross-attention context dim must equal the LLM hidden size. If it
+        # does not, stage 2 will silently drop 32 to_k/to_v matrices again, which
+        # is the entire failure this pathway exists to fix.
+        kv_dim = None
+        for m in unet.modules():
+            if hasattr(m, 'attn2') and hasattr(getattr(m, 'attn2'), 'to_k'):
+                kv_dim = m.attn2.to_k.weight.shape[1]
+                break
+        assert kv_dim == self.txt_embed_dim, (
+            f"unet_config.params.context_dim ({kv_dim}) must equal txt_embed_dim "
+            f"({self.txt_embed_dim}) for the MedGemma conditioning path")
 
-        self.llm_config.text_encoder.to(self.device)
+        self.text_encoder, self.tokenizer, self.token_embed_dim = build_medgemma_text_encoder(
+            self.txt_embed_dim, llm_model=llm_model, llm_load_in_4bit=llm_load_in_4bit)
 
-        llm_emb = self.llm_config.text_encoder(
-            encoded_sentences,
-            context=self.contexts,
-        )  # (B, P, embed_dim)
-        return llm_emb.to(self.dtype)
+        self.train_contexts = bool(train_contexts)
+        if unet.contexts is not None:
+            unet.contexts.requires_grad_(self.train_contexts)
+            print(f"{self.__class__.__name__}: soft prompts "
+                  f"{tuple(unet.contexts.shape)} "
+                  f"({'trainable' if self.train_contexts else 'frozen'})")
+        else:
+            print(f"{self.__class__.__name__}: no soft prompts "
+                  f"(context_length={self.context_length}, n_prompts={self.n_prompts})")
+
+    def _empty_prompt_ids(self):
+        """Token ids for the empty prompt: [BOS, EOS].
+
+        TextContextEncoder inserts the soft prompts after the first token, so what
+        MedGemma sees is [BOS, ctx_1..ctx_L, EOS] and the pooled hidden state is
+        read at the EOS -- stage 2's layout with the EHR sentence removed.
+
+        No right padding: MedGemma is causal, so tokens past the pooled position
+        cannot influence it. That makes this identical to padding out to
+        max_length, on a 10-token sequence instead of 128.
+        """
+        return torch.tensor(
+            [[self.tokenizer.bos_token_id, self.tokenizer.eos_token_id]],
+            dtype=torch.long, device=self.device)
+
+    def get_null_conditioning(self, batch_size):
+        """Empty-prompt embedding, (batch_size, n_prompts, txt_embed_dim)."""
+        contexts = self.model.diffusion_model.contexts
+        if contexts is not None:
+            contexts = contexts.to(device=self.device, dtype=torch.float32)
+
+        # The prompt is constant, so this embedding only moves when the soft
+        # prompts do. Cache it whenever they are frozen; recompute otherwise so
+        # gradients reach `contexts`. Keying on requires_grad (rather than
+        # self.training) keeps validation from reading a stale cache mid-run.
+        cacheable = contexts is None or not contexts.requires_grad
+        if (cacheable and self._null_llm_emb is not None
+                and self._null_llm_emb_device == self.device):
+            emb = self._null_llm_emb
+        else:
+            emb = self.text_encoder(self._empty_prompt_ids(), contexts)  # (1, P, C)
+            if cacheable:
+                self._null_llm_emb = emb.detach()
+                self._null_llm_emb_device = self.device
+        return emb.expand(batch_size, -1, -1)
 
     def forward(self, x, c=None, *args, **kwargs):
         return super().forward(x, c, *args, **kwargs)
@@ -1615,11 +1819,10 @@ class LatentDiffusionCustom(LatentDiffusion):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
-
-        if self.conditioning_mode == 'llm' and self.use_llm:
-            params.append(self.contexts)
-            # params.append(self.seg_embedding)
+        # The soft prompts are model.diffusion_model.contexts, so they are already
+        # in here. Filtering on requires_grad keeps them out of the optimizer when
+        # train_contexts=False; nothing else in the UNet is ever frozen.
+        params = [p for p in self.model.parameters() if p.requires_grad]
 
         if self.cond_stage_trainable:
             params += list(self.cond_stage_model.parameters())
@@ -1646,21 +1849,8 @@ class LatentDiffusionCustom(LatentDiffusion):
         if self.pixel_space:
             return None
         if self.conditioning_mode == 'llm':
-            from dataset import Demographic_Features
-            # During training, recompute each call so gradients flow through
-            # the learnable contexts/seg_embedding.
-            # During eval/inference, cache the result for efficiency.
-            if not self.training and self._null_llm_emb is not None:
-                null_emb = self._null_llm_emb
-            else:
-                encoded = Demographic_Features.tokenize_prompts(
-                    [""], self.llm_config, use_seg=False
-                ).to(self.device)
-                null_emb = self.get_llm_embeddings(encoded)  # (1, P, embed_dim)
-                if not self.training:
-                    self._null_llm_emb = null_emb
             bs = len(prompts) if isinstance(prompts, (list, tuple)) else prompts.shape[0]
-            return null_emb.expand(bs, -1, -1)
+            return self.get_null_conditioning(bs)
         return super().get_learned_conditioning(prompts)
 
     @torch.no_grad()
@@ -1983,16 +2173,34 @@ class Layout2ImgDiffusion(LatentDiffusion):
         logs['bbox_image'] = cond_img
         return logs
 
-class LatentDiffusionCond_LLM(LatentDiffusion):
+class LatentDiffusionCond_LLM(FrozenTextEncoderCheckpointMixin, LatentDiffusion):
 
     def __init__(self,
             *args, llm_model="google/medgemma-1.5-4b-it",
-            llm_load_in_4bit=False, **kwargs):
+            llm_load_in_4bit=False,
+            strict_load=False,
+            expand_concat_channels=True,
+            save_text_encoder=False,
+            **kwargs):
+
+        # Omitting cond_stage_config means "no CLIP". The FrozenCLIPEmbedder this
+        # class used to build was never read -- shared_step conditions through
+        # self.text_encoder -- so it only added ~123M frozen params to every
+        # checkpoint and blocked an exact stage-1 -> stage-2 load. Configs that
+        # still declare one keep the old behaviour. '__is_unconditional__' is not
+        # an option here: LatentDiffusion rewrites conditioning_key to None for
+        # it, which would break the hybrid concat/crossattn path.
+        if kwargs.get('cond_stage_config') is None:
+            kwargs['cond_stage_config'] = {"target": "torch.nn.Identity"}
+
+        # Both are read by init_from_ckpt, which super().__init__ triggers.
+        self.strict_load = strict_load
+        self.expand_concat_channels = expand_concat_channels
 
         super().__init__( *args, **kwargs)
+        self.save_text_encoder = save_text_encoder
+
         ##### LLM part #####
-        # MedGemma 1.5 4B has hidden_dim = 2560
-        # Llama 3.2 3B has hidden_dim = 3072
         # Soft-prompt config is owned by the UNet (self.model.diffusion_model.contexts);
         # mirror it here so both stay in sync. Set unet_config.params.context_length: 0
         # to run the ablation with no soft prompt (contexts is None) while EHR text still
@@ -2000,91 +2208,93 @@ class LatentDiffusionCond_LLM(LatentDiffusion):
         self.txt_embed_dim = self.model.diffusion_model.txt_embed_dim
         self.context_length = self.model.diffusion_model.context_length
         self.n_prompts = self.model.diffusion_model.n_prompts
-
-        self.text_encoder = TextContextEncoder(embed_dim=self.txt_embed_dim)
-
-        self.token_embed_dim = self.text_encoder.text_projection.shape[-1]
-        for name, param in self.text_encoder.named_parameters():
-            param.requires_grad_(False)
-
-        self.text_encoder.llm = True
-        self.text_encoder.llm_type = 'medgemma'  # Track which LLM type we're using
-
-        # MedGemma 1.5 4B path
-        # rep_medgemma = '../llm_model/medgemma-1.5-4b'
-        rep_medgemma = llm_model
-
-        # Use AutoTokenizer for MedGemma (or AutoProcessor if using vision features)
-        self.tokenizer = AutoTokenizer.from_pretrained(rep_medgemma)
-
+        # Retriever protocol: dataset._encode_prompt pads prompts to
+        # max_length - context_length token slots.
         self.max_length = 128
 
-        # Load MedGemma. Default is bf16 (no quantization): on a large-VRAM GPU this is
-        # both faster and higher fidelity for a frozen text encoder. Set
-        # llm_load_in_4bit: true in the config to use bitsandbytes nf4 quantization
-        # instead (saves ~40GB for the 27B model at a small quality/speed cost).
-        # Note: MedGemma is multimodal, but we only use the text/language model part.
-        if llm_load_in_4bit:
-            try:
-                from transformers import BitsAndBytesConfig
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4"
-                )
-                llm_full = AutoModelForCausalLM.from_pretrained(
-                    rep_medgemma,
-                    quantization_config=quantization_config,
-                    device_map="auto",  # auto device placement for quantized model
-                )
-                print("Loaded MedGemma with 4-bit quantization")
-            except ImportError:
-                print("bitsandbytes not installed, loading in bf16 without quantization")
-                llm_full = AutoModelForCausalLM.from_pretrained(
-                    rep_medgemma,
-                    torch_dtype=torch.bfloat16,
-                    device_map="cpu",
-                )
-        else:
-            llm_full = AutoModelForCausalLM.from_pretrained(
-                rep_medgemma,
-                torch_dtype=torch.bfloat16,
-                device_map="cpu",
-            )
-            print("Loaded MedGemma in bf16 (no quantization)")
-
-        # Add special token for medical segmentation
-        self.tokenizer._add_tokens(["<SEG>"], special_tokens=True)
-        llm_full.resize_token_embeddings(len(self.tokenizer) + 1)
-
-        # Extract the language model from MedGemma
-        # MedGemma multimodal structure: llm_full.language_model is Gemma3TextModel
-        # Gemma3TextModel has .embed_tokens for embeddings
-        # For text-only Gemma: llm_full.model is Gemma3TextModel
-        if hasattr(llm_full, 'language_model'):
-            # Multimodal MedGemma structure - language_model IS the Gemma3TextModel
-            self.text_encoder.transformer = llm_full.language_model
-            self.text_encoder.token_embedding = llm_full.language_model.embed_tokens
-        else:
-            # Text-only Gemma structure
-            self.text_encoder.transformer = llm_full.model
-            self.text_encoder.token_embedding = llm_full.model.embed_tokens
-
-        for name, param in self.text_encoder.transformer.named_parameters():
-            param.requires_grad_(False)
-
-        # Compute dtype the text encoder casts embeddings to before the LLM forward.
-        # Both load paths run bf16 compute (full bf16 weights, or nf4 with bf16 compute),
-        # so the frozen MedGemma forward runs in bf16 regardless of quantization.
-        self.text_encoder.llm_compute_dtype = torch.bfloat16
+        # Shared with stage 1 so both stages build byte-identical encoders.
+        self.text_encoder, self.tokenizer, self.token_embed_dim = build_medgemma_text_encoder(
+            self.txt_embed_dim, llm_model=llm_model, llm_load_in_4bit=llm_load_in_4bit)
 
         # Per-epoch loss tracking for CSV logging
         self._train_losses = []
         self._val_losses = []
         self._csv_initialized = False
+    def _init_from_ckpt_exact(self, path, ignore_keys):
+        """Load a stage-1 (unconditional) checkpoint with nothing silently dropped.
+
+        The lenient loader below deletes any key whose shape disagrees with the
+        model and carries on. That is how the CLIP-conditioned stage 1 used to
+        hand over: 34 keys deleted, leaving `contexts`, the input-conv weight and
+        all 32 attn2.to_k/to_v matrices at their random init -- while the matching
+        input-conv *bias* loaded fine, pairing a pretrained bias with a random
+        weight.
+
+        Here everything must line up, with exactly one deliberate exception: the
+        first input convolution. Stage 1 denoises a 4-channel latent; stage 2
+        concatenates the prior-year latent, so its conv is 8-channel. The trained
+        4 channels are copied and the concat half is zero-filled, which makes
+        stage 2 an exact function-preserving copy of stage 1 at step 0 and lets it
+        learn to use the concat branch from there.
+        """
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+        sd = dict(sd)
+
+        for k in list(sd.keys()):
+            # The text encoder is attached after this call and is rebuilt from HF
+            # on every run, so it never takes part in the load.
+            if k.startswith("text_encoder.") or any(k.startswith(ik) for ik in ignore_keys):
+                del sd[k]
+
+        target_sd = self.state_dict()
+
+        conv_in = "model.diffusion_model.input_blocks.0.0.weight"
+        if (conv_in in sd and conv_in in target_sd
+                and sd[conv_in].shape != target_sd[conv_in].shape):
+            src, dst = sd[conv_in], target_sd[conv_in]
+            expandable = (src.shape[0] == dst.shape[0]
+                          and src.shape[2:] == dst.shape[2:]
+                          and src.shape[1] < dst.shape[1])
+            if not (self.expand_concat_channels and expandable):
+                raise RuntimeError(
+                    f"{conv_in}: checkpoint {tuple(src.shape)} vs model "
+                    f"{tuple(dst.shape)}, expand_concat_channels="
+                    f"{self.expand_concat_channels}. Stage 1 and stage 2 may "
+                    f"differ only in input channel count.")
+            expanded = torch.zeros_like(dst)
+            expanded[:, :src.shape[1]] = src
+            sd[conv_in] = expanded
+            print(f"Expanded {conv_in} {tuple(src.shape)} -> {tuple(dst.shape)}: "
+                  f"{src.shape[1]} pretrained channels copied, "
+                  f"{dst.shape[1] - src.shape[1]} concat channels zero-initialised.")
+
+        mismatched = {k: (tuple(sd[k].shape), tuple(target_sd[k].shape))
+                      for k in sd
+                      if k in target_sd and hasattr(sd[k], "shape")
+                      and sd[k].shape != target_sd[k].shape}
+        missing = [k for k in target_sd if k not in sd]
+        unexpected = [k for k in sd if k not in target_sd]
+
+        if mismatched or missing or unexpected:
+            raise RuntimeError(
+                f"strict_load=True but {path} does not match the model.\n"
+                f"  shape mismatches ({len(mismatched)}): {mismatched}\n"
+                f"  missing from checkpoint ({len(missing)}): {missing}\n"
+                f"  unexpected in checkpoint ({len(unexpected)}): {unexpected}\n"
+                "Stage 1 and stage 2 must share unet_config (context_dim, "
+                "context_length, n_prompts, txt_embed_dim) and first_stage_config.")
+
+        self.load_state_dict(sd, strict=True)
+        print(f"Restored from {path}: exact load, {len(sd)} tensors, "
+              f"0 missing, 0 unexpected, 0 dropped.")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        if self.strict_load:
+            # Copy because the lenient path appends to ignore_keys, and the
+            # default argument is one shared list evaluated at def time.
+            return self._init_from_ckpt_exact(path, list(ignore_keys))
 
         sd = torch.load(path, map_location="cpu", weights_only=False)
         
