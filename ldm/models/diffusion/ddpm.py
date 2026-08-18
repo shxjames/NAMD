@@ -1703,7 +1703,13 @@ class LatentDiffusionCustom(LatentDiffusion):
         # Get prompts for unconditional generation
         out = self.get_input(batch)
         prompts = out[1]
-        
+
+        # prompts[:N] can be shorter than N -- a small batch_size, or the last
+        # batch of an epoch. Sampling N latents against fewer conditionings makes
+        # cross-attention einsum on mismatched batch dims. Harmless at
+        # batch_size >= 16, which is why it stayed hidden.
+        N = min(N, len(prompts))
+
         # Determine sampling dimensions
         if self.pixel_space:
             dims = self.image_size  # e.g., 64 for 64x64 images
