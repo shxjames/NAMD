@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sd21-namd-cond
 #SBATCH --account=liyues
-#SBATCH --partition=vvh-l40s   # or --partition=liyues-a100 on the CLI; both work
+#SBATCH --partition=vvh-l40s,liyues-a100   # whichever frees first
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80g
