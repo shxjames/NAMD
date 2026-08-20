@@ -1,0 +1,157 @@
+# NAMD-on-SD2.1, stage 1: unconditional pretraining with SD2.1's own text tower.
+#
+# This is the NAMD recipe (configs/ldm/v1.5-unconditional-unet.yaml) with the
+# SD1.5 backbone swapped for SD2.1-base. Stage 1 keeps the original OpenCLIP-H
+# tower exactly as the v1.5 arm keeps CLIP; MedGemma enters only at stage 2.
+#
+# Deltas vs the v1.5 NAMD stage 1:
+#   - sd21.* targets (Linear proj_in/out SpatialTransformer, SD2.x)
+#   - num_head_channels 64 instead of num_heads 8
+#   - context_dim 1024 (OpenCLIP ViT-H) instead of 768 (CLIP ViT-L)
+#   - init from v2-1_512-ema-pruned.ckpt instead of v1-5-pruned.ckpt
+#
+# NOT the SD2.1 baseline (worktree-sd21-baseline). That arm fine-tuned SD2.1's
+# own VAE and pinned context_length/n_prompts to 0/1. This is an independent
+# run: the NAMD aligned VAE, and the v1.5 soft-prompt defaults left in place.
+#
+# Handoff note: stage 2 swaps the 1024-d OpenCLIP context for MedGemma's 2560-d,
+# so its non-strict load re-initialises all 32 attn2.to_k/to_v plus the 4->8
+# input conv. Stage 1 therefore pretrains the backbone (self-attn, resblocks,
+# time embedding), NOT the cross-attention. That is inherent to the CLIP->LLM
+# design and matches what the v1.5 arm does.
+model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCustom
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "jpg"
+    cond_stage_key: "txt"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: crossattn
+    monitor: val/loss
+    use_ema: False
+    conditioning_mode: clip
+
+    # SD2.1-base init. cond_stage_model is dropped because cond_stage_config
+    # rebuilds the OpenCLIP tower from its HF mirror rather than from this ckpt.
+    ckpt_path: preprocess/v2-1_512-ema-pruned.ckpt
+    ignore_keys: ["first_stage_model", "model_ema", "cond_stage_model"]
+
+    # NAMD aligned (contrastive) VAE, L_align + L_pred. Corroborated by
+    # configs/ldm/v1.5-conditional-unet-ctclip.yaml, which pairs this same
+    # scale_factor with the UNet trained on this VAE. Stage 2 MUST repeat this
+    # number: scale_factor is a config value, not a state_dict entry, so no
+    # checkpoint load can catch a mismatch.
+    scale_factor: 0.519096
+
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaWarmUpCosineScheduler2
+      params:
+        # Absolute step counts -- scripts/sd21_namd/uncond.sbatch overrides both
+        # from the run's real len(train_dataloader()).
+        #
+        # cycle_lengths must EXCEED the total step count but stay near it. Too
+        # small and LambdaWarmUpCosineScheduler2.find_in_interval returns None,
+        # which the caller then indexes (this crashed the SD2.1 baseline uncond
+        # run at step 100k). Unreachably large and the cosine never advances:
+        # t = (n - warmup) / (cycle_length - warmup) stays ~0, so the LR sits
+        # flat at base_lr with no decay -- which is what the baseline's 1e7
+        # actually did. Total + one epoch of headroom gives a real decay to
+        # f_min without the crash.
+        warm_up_steps: [ 4000 ]
+        cycle_lengths: [ 152133 ]   # ~2983 steps/ep x 50 ep + 1 ep headroom
+        f_start: [ 0.01 ]
+        f_max: [ 1. ]
+        f_min: [ 0.1 ]
+
+    unet_config:
+      target: sd21.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        use_checkpoint: True
+        legacy: False
+        # context_length / n_prompts / txt_embed_dim are left at the sd21
+        # defaults (8 / 2 / 2560), matching what v1.5-unconditional-unet.yaml
+        # does by omission. The soft prompts are dead weight in this stage --
+        # the CLIP path never reads them -- but keeping them at 2560 makes
+        # `contexts` shape-match on the stage-2 load instead of being dropped.
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        # NAMD aligned VAE. The ckpt holds only encoder/decoder/quant (248
+        # keys, no contrastive heads), so it loads into a plain AutoencoderKL.
+        # Its training config (configs/autoencoder/contrastive-VAE.yaml) used
+        # resolution 64 / dropout 0.2; neither changes the parameter set --
+        # attn_resolutions is empty so `resolution` never adds a block, and
+        # dropout has no parameters and the VAE is frozen in eval here.
+        ckpt_path: checkpoints/autoencoder/v1.5-autoencoder-contrastive-0211.ckpt
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+      hidden_dim: 256
+
+    cond_stage_config:
+      target: sd21.encoders.FrozenOpenCLIPHFEmbedder
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 16
+    num_workers: 4
+    pin_memory: True
+    shuffle: True
+    ch: 3
+    augment: True
+    rotate: True
+    angles: [45, 90, 135, 180]
+    has_Luna25: true
+    has_DLCS: true
+    has_Luna16: true
+    model_type: "unconditional"
+    base_path: "NLST_with_second_large_cleaned"
+
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  deterministic: true

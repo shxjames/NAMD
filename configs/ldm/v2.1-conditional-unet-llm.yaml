@@ -1,0 +1,161 @@
+# NAMD-on-SD2.1, stage 2: conditional, MedGemma cross-attention.
+#
+# configs/ldm/v1.5-conditional-unet-llm.yaml with the SD1.5 backbone swapped for
+# SD2.1-base. Seeded from the stage-1 checkpoint
+# (configs/ldm/v2.1-unconditional-unet-namd.yaml) via a NON-strict load, exactly
+# as the v1.5 arm does.
+#
+# What the load drops, by design:
+#   - all 32 attn2.to_k/to_v   1024 (OpenCLIP-H) -> 2560 (MedGemma)
+#   - input_blocks.0.0.weight  4 -> 8 channels (prior-year concat)
+#   - contexts, if its shape moved
+# LatentDiffusionCond_LLM.init_from_ckpt walks the stage-1 state_dict against the
+# UNet and appends every shape-mismatched key to ignore_keys before loading, so
+# these are dropped silently rather than raising. Stage 1 therefore hands over a
+# pretrained backbone, not a pretrained conditioning pathway.
+#
+# ckpt_path is set at launch:
+#   --set model.params.ckpt_path=checkpoints/<stage1-project>/last.ckpt
+model:
+  base_learning_rate: 2.0e-05
+  target: ldm.models.diffusion.ddpm.LatentDiffusionCond_LLM
+  params:
+    linear_start: 0.00085
+    linear_end: 0.012
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: jpg
+    cond_stage_key: txt
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: hybrid
+    monitor: val/loss
+    use_ema: false
+
+    ckpt_path: YOUR_STAGE1_CKPT
+
+    # init_from_ckpt shape-checks only against the UNet (self.model), so a
+    # cond_stage_model whose shapes moved would reach load_state_dict and raise
+    # on size mismatch rather than being filtered. Dropping those keys here is
+    # safe: FrozenOpenCLIPHFEmbedder reloads its own weights from HF in __init__,
+    # and nothing reads them anyway (see cond_stage_config below).
+    ignore_keys: ["cond_stage_model", "model_ema"]
+
+    llm_model: google/medgemma-1.5-4b-it
+    llm_load_in_4bit: True
+
+    # Must equal the stage-1 value. scale_factor is a config value, not a
+    # state_dict entry, so no checkpoint load can catch a mismatch here.
+    scale_factor: 0.519096
+
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaWarmUpCosineScheduler2
+      params:
+        # Absolute step counts -- scripts/sd21_namd/cond.sbatch overrides both
+        # from the run's real len(train_dataloader()). See the stage-1 config for
+        # why cycle_lengths must exceed the total but stay close to it.
+        #
+        # Warmup matters more than decay here: the 4 concat channels in the input
+        # conv and all 32 cross-attention matrices are freshly initialised and
+        # must learn from scratch, while the rest of the UNet is pretrained and
+        # worth protecting from AdamW's first, least-reliable updates.
+        warm_up_steps: [ 2300 ]     # ~5% of the run
+        cycle_lengths: [ 46460 ]    # ~460 steps/ep x 100 ep + 1 ep headroom
+        f_start: [ 0.01 ]
+        f_max: [ 1. ]
+        f_min: [ 0.1 ]
+
+    unet_config:
+      target: sd21.openaimodel.UNetModel
+      params:
+        image_size: 32
+        in_channels: 8      # 4 noise + 4 prior-year concat
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions:
+        - 4
+        - 2
+        - 1
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 4
+        - 4
+        num_head_channels: 64
+        use_spatial_transformer: true
+        use_linear_in_transformer: true
+        transformer_depth: 1
+        context_dim: 2560          # MedGemma 1.5 4B hidden dim
+        use_checkpoint: false
+        legacy: false
+        context_length: 8
+        n_prompts: 2
+        txt_embed_dim: 2560
+
+    # No ckpt_path: the VAE rides in on the stage-1 checkpoint, which guarantees
+    # it is the one stage 1 actually trained against. ddconfig must stay
+    # identical to stage 1 or the weights will not line up.
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          tanh_out: true
+        lossconfig:
+          target: torch.nn.Identity
+
+    # Never read -- shared_step conditions through self.text_encoder (MedGemma).
+    # It is here because LatentDiffusion.instantiate_cond_stage runs before the
+    # checkpoint load and the v1.5 template keeps its tower for the same reason.
+    # Matched to stage 1's tower so the two stages stay structurally identical.
+    cond_stage_config:
+      target: sd21.encoders.FrozenOpenCLIPHFEmbedder
+
+data:
+  target: dataset.Lung_Pair_DM
+  params:
+    batch_size: 8
+    num_workers: 1
+    pin_memory: true
+    shuffle: true
+    ch: 3
+    prune: true
+    augment: true
+    rotate: true
+    angles:
+    - 45
+    - 90
+    - 135
+    base_path: NLST_with_second_large_cleaned
+    model_type: conditional
+    construct_prompt: true
+
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 5
+  track_grad_norm: 2
+  deterministic: true
