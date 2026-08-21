@@ -18,18 +18,27 @@ STRIDE=${4:-10}
 
 OUT="${STEM}.out"
 ERR="${STEM}.err"
-OFF_OUT=0
-OFF_ERR=0
 LAST_EPOCH=-1
 STARTED=0
 
 size_of() { [ -f "$1" ] && stat -c %s "$1" || echo 0; }
 
+# Start past whatever is already in the log. The launchers write --output=%x.out,
+# keyed on job NAME, so a resubmit reuses the same path: starting at 0 would
+# replay the previous run's traceback as if it were this one's. (It did.)
+OFF_OUT=$(size_of "$OUT")
+OFF_ERR=$(size_of "$ERR")
+
 # Read bytes appended since the last poll, with \r split so progress-bar
 # redraws become separate lines instead of one giant one.
+#
+# A shrunk file means SLURM truncated it as the new job started writing, so the
+# saved offset now points past the end and every future read would come back
+# empty. Rewind to 0 and take the new run from the top.
 since() {
   local f=$1 off=$2 sz
   sz=$(size_of "$f")
+  [ "$sz" -lt "$off" ] && off=0
   [ "$sz" -le "$off" ] && return 0
   tail -c +$((off + 1)) "$f" 2>/dev/null | tr '\r' '\n'
 }
