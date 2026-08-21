@@ -157,5 +157,9 @@ trainer:
   gradient_clip_algorithm: norm
   accumulate_grad_batches: 1
   log_every_n_steps: 5
-  track_grad_norm: 2
+  # track_grad_norm dropped: Lightning's _track_grad_norm reads
+  # trainer.logger.group_separator unconditionally, so it raises
+  # AttributeError on None the first time an optimizer steps. The v1.5 runs it
+  # was inherited from used wandb; these run logger-less. Stage 1 never had it,
+  # which is why only this stage hit it.
   deterministic: true

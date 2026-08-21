@@ -16,7 +16,12 @@
 #   sbatch --export=ALL,UNCOND_CKPT=checkpoints/sd21-namd-uncond-bs16-lr1.0e-04/last.ckpt \
 #          scripts/sd21_namd/cond.sbatch
 #
-# Optional --export overrides: BS, LR, EPOCHS.
+# Optional --export overrides: BS, LR, EPOCHS, PROJECT.
+#
+# A 1-epoch smoke before committing 13 h, into its own project so it cannot
+# write into the real run's checkpoint dir:
+#   sbatch --export=ALL,UNCOND_CKPT=...,EPOCHS=1,PROJECT=sd21-namd-cond-smoke \
+#          scripts/sd21_namd/cond.sbatch
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
@@ -26,6 +31,7 @@ cd "$SLURM_SUBMIT_DIR"
 BS=${BS:-8}
 LR=${LR:-2.0e-05}
 EPOCHS=${EPOCHS:-100}
+PROJECT=${PROJECT:-sd21-namd-cond-bs${BS}-lr${LR}}
 CONFIG=configs/ldm/v2.1-conditional-unet-llm.yaml
 PY=/scratch/liyues_root/liyues/shxjames/envs/NAMD/bin/python
 
@@ -42,7 +48,7 @@ WARMUP=$(( TOTAL / 20 ))            # 5% -- the concat channels and all 32
 echo "steps/epoch=${STEPS} total=${TOTAL} warmup=${WARMUP} cycle=${CYCLE}"
 
 $PY run.py --config $CONFIG --train \
-  --project sd21-namd-cond-bs${BS}-lr${LR} --seed 23 --save_top_k 3 \
+  --project ${PROJECT} --seed 23 --save_top_k 3 \
   --monitor_loss "val/loss" \
   --set model.params.ckpt_path=${UNCOND_CKPT} \
         data.params.batch_size=${BS} \
