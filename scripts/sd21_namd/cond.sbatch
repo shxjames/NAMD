@@ -4,7 +4,7 @@
 #SBATCH --partition=vvh-l40s,liyues-a100   # whichever frees first
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=100g
+#SBATCH --mem=120g   # bs16 peaked at 97 GiB against a 100 G request
 #SBATCH --time=72:00:00
 #SBATCH --output=%x.out
 #SBATCH --error=%x.err

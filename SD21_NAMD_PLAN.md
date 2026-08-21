@@ -126,7 +126,44 @@ MedGemma arm, plus ~155 GB of checkpoints.
 | configs + launchers | UNet build and stage-1→2 transfer verified on meta device before submitting |
 | stage 1 (uncond) | **COMPLETED** — job 27510622, 15:39:24 on vvh-l40s (lh1200), 18.8 min/epoch, 0 errors |
 | stage 2 smoke | **COMPLETED** — job 27514619, 1 epoch in 11:36, val/loss 0.281, 0 errors |
-| stage 2 (cond) | **running** — job 27514632, seeded from stage-1 `last.ckpt` (ep49) |
+| stage 2 (cond) | **COMPLETED** — job 27514675, 7:37:25, 4.6 min/epoch, 0 errors |
+
+### Stage 2 final (job 27514675 — constant LR 2e-5, bs16, 100 epochs)
+
+Superseded job 27514632 (bs8, cosine schedule), cancelled at epoch ~19 when the
+recipe changed to a flat LR.
+
+Handoff: `checkpoints/sd21-namd-cond-bs16-lr2.0e-05/last.ckpt` (epoch 99, 15.6 GB).
+Lowest-val reference: `epoch=38-val/loss=0.229.ckpt`.
+
+| epoch | train/loss | val/loss |
+|---|---|---|
+| 5 | — | 0.275 |
+| 14–32 | — | 0.253 (plateau) |
+| **38** | — | **0.229**  ← best |
+| 45 | — | 0.230 |
+| 69 | 0.192 | 0.279 |
+| 79 | 0.164 | 0.374 |
+| 89 | 0.141 | 0.365 |
+| **99** | **0.124** | **0.471** |
+
+The `lr` column in `logs/sd21-namd-cond-bs16-lr2.0e-05/loss_log.csv` reads
+`0.00002000` at every epoch — the flat LR confirmed end to end.
+
+val/loss bottomed at epoch 38 and then climbed steadily to 0.471 while train/loss
+kept falling to 0.124. **This is expected, not a failure.** The SD2.1 baseline's
+conditional stage did the same thing (val/loss 0.36–0.42 by epochs 50–69) and its
+ep70 `last.ckpt` still beat the lowest-val ep21 checkpoint on AUROC, AUPRC, LPIPS
+and all four nodule-property metrics. Hence the select-late handoff. Keeping
+`epoch=38` gives the same late-vs-lowest contrast for this arm.
+
+Dropping the warmup along with the schedule produced **no opening loss spike** —
+val/loss descended smoothly from epoch 1 despite the freshly-initialised
+cross-attention taking full-rate updates from step 1.
+
+**Memory, again: 100g is marginal at bs16.** MaxRSS 101,954,424 K against the
+100 G request — 97% of the limit. Stage 1 at bs16 hit 99.96% of 80 G. Anything
+rerun at this batch size wants ~120g.
 
 ### Stage 2 detail
 
