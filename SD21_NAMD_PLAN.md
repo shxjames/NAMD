@@ -109,9 +109,12 @@ sbatch --export=ALL,UNCOND_CKPT=checkpoints/sd21-namd-uncond-bs16-lr1.0e-04/last
        scripts/sd21_namd/cond.sbatch
 ```
 
-Both request `--mem=80g`: these LDM stages peaked at 50.3 GB RSS and OOM-killed
-at 48g. `save_top_k` is 3; `run.py` sets `save_last=True` unconditionally, so
-`last.ckpt` is always there for the select-late rule.
+Both request `--mem=100g`. 80g is **not** enough margin: stage 1 completed with
+MaxRSS 83,851,016 K against an 80 G request — 99.96% of the limit, surviving by
+~34 MB. The pooled Luna25 + DLCS + Luna16 + NLST loader at bs16 is far heavier
+than the 50.3 GB peak measured on earlier arms. `save_top_k` is 3; `run.py` sets
+`save_last=True` unconditionally, so `last.ckpt` is always there for the
+select-late rule.
 
 Expect roughly 21 h stage 1 and 7–9 h stage 2, extrapolating from the SD1.5
 MedGemma arm, plus ~155 GB of checkpoints.
@@ -120,6 +123,37 @@ MedGemma arm, plus ~155 GB of checkpoints.
 
 | Stage | Result |
 |---|---|
-| configs + launchers | written, UNet build and stage-1→2 transfer verified on meta device; **nothing submitted** |
-| stage 1 (uncond) | not started |
+| configs + launchers | UNet build and stage-1→2 transfer verified on meta device before submitting |
+| stage 1 (uncond) | **COMPLETED** — job 27510622, 15:39:24 on vvh-l40s (lh1200), 18.8 min/epoch, 0 errors |
 | stage 2 (cond) | not started |
+
+### Stage 1 detail (job 27510622, 2026-08-20 → 08-21)
+
+Probe derived **2969 steps/epoch** (warmup 4000, cycle 151419) against a 2983
+estimate. Load was clean: the aligned VAE restored with 0 missing / 0 unexpected,
+and the SD2.1 init's 638 missing keys were exactly the ignored ones —
+388 `cond_stage_model` + 248 `first_stage_model` + `model.diffusion_model.contexts`
++ `triplet_loss_weight`. **No UNet weight was missing**, so the SD2.1 backbone
+loaded in full.
+
+| epoch | val/loss |
+|---|---|
+| 1 | 0.268 |
+| 9 | 0.247 |
+| 18 | 0.245 |
+| 29 | 0.248 |
+| **45** | **0.234**  ← best |
+| 48, 49 | 0.243 |
+
+val/loss sat in a 0.245–0.249 band from epoch 9 to 39, then fell to 0.234 at
+epoch 45 as the cosine decayed toward `f_min`. **That late gain is only available
+because `cycle_lengths` was sized to the real step count** — the baseline's
+unreachable `1e7` pins the LR flat at `f_max`, so it can never decay.
+
+Handoff to stage 2 (select-late rule):
+`checkpoints/sd21-namd-uncond-bs16-lr1.0e-04/last.ckpt` (epoch 49, 12.1 GB).
+Lowest-val reference: `epoch=45-val/loss=0.234.ckpt`.
+
+**val/loss is not comparable to the SD2.1 baseline's.** This arm scales latents
+by 0.519096 and the baseline by 0.580121, so the noise-prediction target lives on
+a different scale. The arms compare only through the downstream evals.
