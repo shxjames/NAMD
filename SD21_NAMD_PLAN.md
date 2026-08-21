@@ -125,7 +125,44 @@ MedGemma arm, plus ~155 GB of checkpoints.
 |---|---|
 | configs + launchers | UNet build and stage-1→2 transfer verified on meta device before submitting |
 | stage 1 (uncond) | **COMPLETED** — job 27510622, 15:39:24 on vvh-l40s (lh1200), 18.8 min/epoch, 0 errors |
-| stage 2 (cond) | **submitted** — job 27514617, seeded from stage-1 `last.ckpt` (ep49) |
+| stage 2 smoke | **COMPLETED** — job 27514619, 1 epoch in 11:36, val/loss 0.281, 0 errors |
+| stage 2 (cond) | **running** — job 27514632, seeded from stage-1 `last.ckpt` (ep49) |
+
+### Stage 2 detail
+
+Probe derives **450 steps/epoch** at bs8 → total 45000, warmup 2250, cycle 45450.
+
+The handoff landed exactly as the meta-device dry-run predicted:
+
+```
+Restored from checkpoints/sd21-namd-uncond-bs16-lr1.0e-04/last.ckpt
+  with 421 missing and 0 unexpected keys
+```
+
+421 = 388 `cond_stage_model` (dropped via `ignore_keys`) + the 33 shape-mismatched
+UNet keys (1 input conv 4→8, 16 `attn2.to_k`, 16 `attn2.to_v`). `first_stage_model`
+shows 0 missing, confirming the VAE rode in on the stage-1 checkpoint.
+
+**Two failures got here, both worth recording:**
+
+1. Job 27514617, FAILED in 36 s. `steps_per_epoch.py` called `dm.setup()` with no
+   retriever. The conditional dataset builds a prompt per subject and needs one
+   (`run.py` passes the model). Every subject raised, the dataset's per-subject
+   `except ... continue` swallowed all of them, and `np.stack` got an empty list —
+   surfacing only as `need at least one array to stack`. Fixed with a tokenizer
+   stub plus a loud empty-split check. Stage 1 was immune: `model_type:
+   unconditional` never constructs prompts.
+2. Job 27514618, FAILED at 2:27, at the first optimizer step.
+   `AttributeError: 'NoneType' object has no attribute 'group_separator'` —
+   Lightning's `_track_grad_norm` reads `trainer.logger.group_separator`
+   unconditionally, so `track_grad_norm: 2` cannot survive a logger-less run. It
+   came from the v1.5 template, whose runs used wandb. `worktree-sd21-baseline`
+   had already fixed this in `96df2c6`; forking from `NAMD-eos` meant not
+   inheriting it.
+
+Both only surfaced once training actually started, so stage 2 now smoke-tests
+first: `EPOCHS=1 PROJECT=sd21-namd-cond-smoke` writes to its own checkpoint dir,
+costs ~12 min, and would have caught either.
 
 ### Stage 1 detail (job 27510622, 2026-08-20 → 08-21)
 
