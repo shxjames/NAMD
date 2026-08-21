@@ -125,7 +125,7 @@ MedGemma arm, plus ~155 GB of checkpoints.
 |---|---|
 | configs + launchers | UNet build and stage-1→2 transfer verified on meta device before submitting |
 | stage 1 (uncond) | **COMPLETED** — job 27510622, 15:39:24 on vvh-l40s (lh1200), 18.8 min/epoch, 0 errors |
-| stage 2 (cond) | not started |
+| stage 2 (cond) | **submitted** — job 27514617, seeded from stage-1 `last.ckpt` (ep49) |
 
 ### Stage 1 detail (job 27510622, 2026-08-20 → 08-21)
 
