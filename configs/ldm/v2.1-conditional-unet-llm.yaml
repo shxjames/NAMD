@@ -50,22 +50,19 @@ model:
     # state_dict entry, so no checkpoint load can catch a mismatch here.
     scale_factor: 0.519096
 
-    scheduler_config:
-      target: ldm.lr_scheduler.LambdaWarmUpCosineScheduler2
-      params:
-        # Absolute step counts -- scripts/sd21_namd/cond.sbatch overrides both
-        # from the run's real len(train_dataloader()). See the stage-1 config for
-        # why cycle_lengths must exceed the total but stay close to it.
-        #
-        # Warmup matters more than decay here: the 4 concat channels in the input
-        # conv and all 32 cross-attention matrices are freshly initialised and
-        # must learn from scratch, while the rest of the UNet is pretrained and
-        # worth protecting from AdamW's first, least-reliable updates.
-        warm_up_steps: [ 2300 ]     # ~5% of the run
-        cycle_lengths: [ 46460 ]    # ~460 steps/ep x 100 ep + 1 ep headroom
-        f_start: [ 0.01 ]
-        f_max: [ 1. ]
-        f_min: [ 0.1 ]
+    # No scheduler_config: constant LR at base_learning_rate for the whole run.
+    # DDPM sets use_scheduler = scheduler_config is not None, so omitting it is
+    # what disables the LambdaLR -- there is no separate switch. run.py assigns
+    # model.learning_rate = config.model.base_learning_rate with no batch-size
+    # scaling, so 2e-5 here is literally 2e-5 at any batch size.
+    #
+    # This drops the warmup the earlier revision carried. Worth knowing what that
+    # gives up: the 4 concat channels in the input conv and all 32
+    # cross-attention matrices arrive freshly initialised and now take full-rate
+    # updates from step 1, alongside a pretrained backbone, while AdamW's second
+    # moments are still cold. The previous conditional arms ran constant 2e-5
+    # from step 1 as well, so this is the established recipe rather than a new
+    # risk -- but it is the reason to watch the first few epochs for a loss spike.
 
     unet_config:
       target: sd21.openaimodel.UNetModel
@@ -132,7 +129,7 @@ model:
 data:
   target: dataset.Lung_Pair_DM
   params:
-    batch_size: 8
+    batch_size: 16
     num_workers: 1
     pin_memory: true
     shuffle: true
