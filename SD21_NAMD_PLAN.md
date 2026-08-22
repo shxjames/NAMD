@@ -172,12 +172,27 @@ rerun at this batch size wants ~120g.
 (copied aside immediately — eval_all.py names its JSON by guidance only, so the
 next run at guidance 1.0 overwrites `eval_all_1.0.json`).
 
+All ± are std over the 20 seeds (n=20 for every cell below).
+
 | arm / ckpt | AUROC per-seed | AUPRC per-seed | LPIPS | FID |
 |---|---|---|---|---|
-| **NAMD-on-SD2.1, ep99 (last)** | **0.783 ± 0.017** | **0.352 ± 0.040** | 0.218 | **89.6 ± 0.7** |
-| SD2.1 baseline, ep70 (last) | 0.787 ± 0.013 | 0.351 ± 0.031 | 0.189 | 105.7 ± 0.9 |
-| SD2.1 baseline, ep21 (lowest val) | 0.727 ± 0.029 | 0.280 ± 0.034 | 0.211 | 88.0 ± 0.9 |
+| **NAMD-on-SD2.1, ep99 (last)** | **0.783 ± 0.017** | **0.352 ± 0.040** | 0.2176 ± 0.0013 | **89.58 ± 0.71** |
+| SD2.1 baseline, ep70 (last) | 0.787 ± 0.013 | 0.351 ± 0.031 | 0.1890 ± 0.0015 | 105.74 ± 0.87 |
+| SD2.1 baseline, ep21 (lowest val) | 0.727 ± 0.029 | 0.280 ± 0.034 | 0.2115 ± 0.0022 | 88.00 ± 0.90 |
 | SD1.5 CLIP + PRED-VAE, ep40 | 0.764 | 0.293 | 0.208 | 77.3 |
+
+(the SD1.5 row is carried from `sd21/README.md`, which recorded no std for it)
+
+**The seed-to-seed spread on LPIPS and FID is tiny compared with the gaps**, so
+unlike AUROC/AUPRC these differences are decisive rather than noise. Against the
+baseline's ep70: LPIPS is worse by 0.0286, roughly 19 pooled std; FID is better
+by 16.2, roughly 20 pooled std. Against its ep21: LPIPS worse by 0.006 (~3 std),
+FID worse by 1.6 (~2 std).
+
+So the arms separate cleanly on perceptual quality and in opposite directions —
+this one produces distributionally more realistic images (FID) that are further
+from the specific ground-truth follow-up (LPIPS) — while being indistinguishable
+on the discriminative metrics.
 
 Reference points from this run: `auc_gt` (real images) **0.8136**, `auc_cond`
 (prior-year image) **0.7417**. So the arm recovers most of the gap between the
