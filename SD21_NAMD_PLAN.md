@@ -165,6 +165,43 @@ cross-attention taking full-rate updates from step 1.
 100 G request — 97% of the limit. Stage 1 at bs16 hit 99.96% of 80 G. Anything
 rerun at this batch size wants ~120g.
 
+## Eval — eval_all.py, last.ckpt (job 27516100, 10:23)
+
+20 seeds, guidance 1.0, 50 steps, batch 64, test split (450 subjects).
+`results/sd21-namd-cond-bs16-lr2.0e-05/eval_all_1.0_last.json`
+(copied aside immediately — eval_all.py names its JSON by guidance only, so the
+next run at guidance 1.0 overwrites `eval_all_1.0.json`).
+
+| arm / ckpt | AUROC per-seed | AUPRC per-seed | LPIPS | FID |
+|---|---|---|---|---|
+| **NAMD-on-SD2.1, ep99 (last)** | **0.783 ± 0.017** | **0.352 ± 0.040** | 0.218 | **89.6 ± 0.7** |
+| SD2.1 baseline, ep70 (last) | 0.787 ± 0.013 | 0.351 ± 0.031 | 0.189 | 105.7 ± 0.9 |
+| SD2.1 baseline, ep21 (lowest val) | 0.727 ± 0.029 | 0.280 ± 0.034 | 0.211 | 88.0 ± 0.9 |
+| SD1.5 CLIP + PRED-VAE, ep40 | 0.764 | 0.293 | 0.208 | 77.3 |
+
+Reference points from this run: `auc_gt` (real images) **0.8136**, `auc_cond`
+(prior-year image) **0.7417**. So the arm recovers most of the gap between the
+prior-year scan and the real follow-up.
+
+**Report `avg_score`, never `avg_pred`.** This run's `auc_model_avg_pred` is
+0.8234, which is *above* the 0.8136 real-image ceiling — it averages predictions
+over 20 seeds, so it is a 20-sample ensemble rather than a single generated
+image, and it is not a valid headline number. Same for
+`auprc_model_avg_pred` (0.4023 vs 0.3896 gt).
+
+Reading it: against the SD2.1 baseline's own late checkpoint, AUROC (0.783 vs
+0.787) and AUPRC (0.352 vs 0.351) are statistically indistinguishable — the
+AUROC gap is a quarter of one standard deviation. FID is clearly better
+(89.6 vs 105.7); LPIPS is clearly worse (0.218 vs 0.189). Against the SD1.5 CLIP
+arm, AUROC and AUPRC are both better.
+
+Also emitted: predictive variance across seeds (mean 0.0784), and
+`error_vs_variance_pearson_r` = **0.393** — the model's seed-to-seed disagreement
+correlates with its actual error, which is the useful calibration signal.
+
+Triplets: `nodule_quality_eval/triplets/sd21-namd-cond-bs16-lr2.0e-05-last/`,
+20 seed dirs, 612 MB — ready for the nodule-property eval.
+
 ### Stage 2 detail
 
 Probe derives **450 steps/epoch** at bs8 → total 45000, warmup 2250, cycle 45450.
