@@ -113,6 +113,23 @@ def load_stack_by_indices(
     return torch.stack(planes, dim=0)
 
 
+def dataset_flags(dataset: Dataset) -> List[int]:
+    """Per-sample binary conditioning flag, whichever dataset flavour is in use.
+
+    NLSTPairedDataset publishes `sample_labels` directly; the original NIfTI
+    dataset resolves the oracle expansion flag through its clinical metadata.
+    """
+    labels = getattr(dataset, "sample_labels", None)
+    if labels is not None:
+        return [int(v) for v in labels]
+
+    flags = []
+    for sample in dataset.samples:
+        exp = dataset.metadata_expansion.get(sample["patient_key"], 0)
+        flags.append(0 if pd.isna(exp) else int(exp))
+    return flags
+
+
 class ExpansionBalancedSampler(Sampler):
     def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False):
         self.dataset = dataset
@@ -125,10 +142,7 @@ class ExpansionBalancedSampler(Sampler):
         self.exp_idx = []
         self.stab_idx = []
 
-        for i, s in enumerate(dataset.samples):
-            patient_key = s["patient_key"]
-            exp = dataset.metadata_expansion.get(patient_key, 0)
-            flag = 0 if pd.isna(exp) else int(exp)
+        for i, flag in enumerate(dataset_flags(dataset)):
             (self.exp_idx if flag == 1 else self.stab_idx).append(i)
 
         if len(self.exp_idx) == 0 or len(self.stab_idx) == 0:
@@ -442,6 +456,8 @@ class PairedNiftiSliceDataset(Dataset):
         self.default_slice_thickness_mm = float(default_slice_thickness_mm)
         self._load_slice_thickness(slice_thickness_csv)
 
+        self.n_aux = 2  # iph, ivh
+
         self.keep_only_baseline_iph_slices = keep_only_baseline_iph_slices
         self.seg_threshold = float(seg_threshold)
         self.min_lesion_pixels_2d = int(min_lesion_pixels_2d)
@@ -709,21 +725,51 @@ class PairedNiftiSliceDataset(Dataset):
         clinical_vars = self._get_clinical_vars(s["patient_key"])
         expansion_flag = self._get_expansion_flag(s["patient_key"])
 
-        return bl_ct_t, fu_ct_t, bl_iph_t, bl_ivh_t, fu_iph_t, fu_ivh_t, clinical_vars, expansion_flag
+        # Uniform 6-tuple contract shared with NLSTPairedDataset: the two
+        # segmentation channels travel as a stacked aux tensor [n_aux, K, H, W]
+        # so downstream code is written once against a variable channel count.
+        aux_bl = torch.stack([bl_iph_t, bl_ivh_t], dim=0)
+        aux_fu = torch.stack([fu_iph_t, fu_ivh_t], dim=0)
+
+        return bl_ct_t, fu_ct_t, aux_bl, aux_fu, clinical_vars, expansion_flag
 
 
 @torch.inference_mode()
-def encode_triplet_stack_chunked(ae, ct, iph, ivh, batch_chunk=2):
-    b, k, h, w = ct.shape
+def _plane(img, aux, j):
+    """AE input for context plane j: [B, 1 + n_aux, H, W].
+
+    `aux` is [B, n_aux, K, H, W] and may be empty (n_aux == 0), in which case
+    the AE sees only the image channel -- the NLST case.
+    """
+    channels = [img[:, j : j + 1]]
+    if aux is not None and aux.shape[1] > 0:
+        channels.extend(aux[:, a, j : j + 1] for a in range(aux.shape[1]))
+    return torch.cat(channels, dim=1)
+
+
+def _flatten_planes(img, aux):
+    """All K planes concatenated channel-wise: [B, K * (1 + n_aux), H, W]."""
+    return torch.cat([_plane(img, aux, j) for j in range(img.shape[1])], dim=1)
+
+
+def encode_stack_chunked(ae, img, aux=None, batch_chunk=2):
+    b, k = img.shape[0], img.shape[1]
     zs = []
     for j in range(k):
-        xj = torch.cat([ct[:, j : j + 1], iph[:, j : j + 1], ivh[:, j : j + 1]], dim=1)
+        xj = _plane(img, aux, j)
         z_parts = []
-        for s in range(0, b, batch_chunk):
-            z_parts.append(ae.encode_stage_2_inputs(xj[s : s + batch_chunk]))
-        zj = torch.cat(z_parts, dim=0)
-        zs.append(zj)
+        for start in range(0, b, batch_chunk):
+            z_parts.append(ae.encode_stage_2_inputs(xj[start : start + batch_chunk]))
+        zs.append(torch.cat(z_parts, dim=0))
     return torch.cat(zs, dim=1)
+
+
+def encode_center(ae, img, aux, mid):
+    return ae.encode_stage_2_inputs(_plane(img, aux, mid))
+
+
+def encode_triplet_stack_chunked(ae, ct, iph, ivh, batch_chunk=2):
+    return encode_stack_chunked(ae, ct, torch.stack([iph, ivh], dim=1), batch_chunk=batch_chunk)
 
 
 def extract_center_latent_from_stack(z_stack: torch.Tensor, k: int) -> torch.Tensor:
@@ -734,8 +780,7 @@ def extract_center_latent_from_stack(z_stack: torch.Tensor, k: int) -> torch.Ten
 
 
 def encode_center_triplet(ae, ct, iph, ivh, mid):
-    x_mid = torch.cat([ct[:, mid : mid + 1], iph[:, mid : mid + 1], ivh[:, mid : mid + 1]], dim=1)
-    return ae.encode_stage_2_inputs(x_mid)
+    return encode_center(ae, ct, torch.stack([iph, ivh], dim=1), mid)
 
 
 def decode_center_from_stack(ae, z_stack, k):
@@ -982,8 +1027,15 @@ class MultiHeadAEKL(nn.Module):
         channels: tuple = (64, 128, 128),
         norm_num_groups: int = 32,
         attention_levels: tuple = (False, False, False),
+        head_names: tuple = ("ct", "iph", "ivh"),
     ):
         super().__init__()
+
+        # One 1x1 head per output channel. HemExp reconstructs (ct, iph, ivh);
+        # NLST has no segmentations, so it trains with head_names=("ct",) and
+        # in_channels=1. Keeping the "<name>_head" attribute naming leaves the
+        # 3-head state dict byte-identical, so existing checkpoints still load.
+        self.head_names = tuple(head_names)
 
         self.backbone = AutoencoderKL(
             spatial_dims=spatial_dims,
@@ -996,17 +1048,15 @@ class MultiHeadAEKL(nn.Module):
             attention_levels=attention_levels,
         )
 
-        self.ct_head = nn.Conv2d(feature_channels, 1, 1)
-        self.iph_head = nn.Conv2d(feature_channels, 1, 1)
-        self.ivh_head = nn.Conv2d(feature_channels, 1, 1)
+        for name in self.head_names:
+            setattr(self, f"{name}_head", nn.Conv2d(feature_channels, 1, 1))
+
+    def _apply_heads(self, y):
+        return torch.cat([getattr(self, f"{n}_head")(y) for n in self.head_names], dim=1)
 
     def forward(self, x):
         y, mu, logvar = self.backbone(x)
-        ct = self.ct_head(y)
-        iph = self.iph_head(y)
-        ivh = self.ivh_head(y)
-        recon = torch.cat([ct, iph, ivh], dim=1)
-        return recon, mu, logvar
+        return self._apply_heads(y), mu, logvar
 
     @torch.no_grad()
     def encode_stage_2_inputs(self, x):
@@ -1016,11 +1066,7 @@ class MultiHeadAEKL(nn.Module):
 
     @torch.no_grad()
     def decode(self, z):
-        y = self.backbone.decode(z)
-        ct = self.ct_head(y)
-        iph = self.iph_head(y)
-        ivh = self.ivh_head(y)
-        return torch.cat([ct, iph, ivh], dim=1)
+        return self._apply_heads(self.backbone.decode(z))
 
 
 class Unet(Module):
@@ -1044,6 +1090,7 @@ class Unet(Module):
         full_attn=None,
         flash_attn=False,
         use_clinical=True,
+        clinical_dim=7,
         use_expansion_flag_input=True,
         predict_segmentation=True,
         use_latent_diffusion=True,
@@ -1088,8 +1135,14 @@ class Unet(Module):
         self.time_mlp = nn.Sequential(sinu_pos_emb, nn.Linear(fourier_dim, time_dim), nn.GELU(), nn.Linear(time_dim, time_dim))
 
         if self.use_clinical:
+            # Width of the tabular conditioning vector: 7 for HemExp's
+            # hemorrhage variables, 13 for NLST's biomarker + EHR selection
+            # (16 for literal NAMD parity). First-timepoint features only.
+            self.clinical_dim = int(clinical_dim)
             self.clinical_embedding_dim = time_dim
-            self.clinical_vars_mlp = nn.Sequential(nn.Linear(7, time_dim), nn.GELU(), nn.Linear(time_dim, time_dim))
+            self.clinical_vars_mlp = nn.Sequential(
+                nn.Linear(self.clinical_dim, time_dim), nn.GELU(), nn.Linear(time_dim, time_dim)
+            )
             self.null_clin_emb = nn.Parameter(torch.randn(time_dim))
             self._pos_weight = None
 
@@ -1193,6 +1246,11 @@ class Unet(Module):
 
         if self.use_clinical:
             clin_vec = clinical_vars
+            if clin_vec.shape[-1] != self.clinical_dim:
+                raise ValueError(
+                    f"clinical vector is {clin_vec.shape[-1]}-dim but the model was built for "
+                    f"{self.clinical_dim}; check model.clinical_dim against the dataset feature selection"
+                )
             B, device = clin_vec.size(0), clin_vec.device
             clin_emb_full = self.clinical_vars_mlp(clin_vec)
 
@@ -1834,8 +1892,23 @@ class Trainer:
         min_lesion_pixels_2d: int = 1,
         latent_mean=None,
         latent_std=None,
+        dataset_kind: str = "nifti",
+        nlst_base_path: str = None,
+        nlst_train_split: str = "train",
+        nlst_val_split: str = "val",
+        nlst_selected_features=None,
+        nlst_excluded_features=None,
+        nlst_normalize_clinical: bool = True,
+        nlst_clinical_mean=None,
+        nlst_clinical_std=None,
+        aux_names: tuple = ("iph", "ivh"),
     ):
         super().__init__()
+
+        self.dataset_kind = str(dataset_kind)
+        if self.dataset_kind not in ("nifti", "nlst"):
+            raise ValueError(f"dataset_kind must be 'nifti' or 'nlst', got {dataset_kind!r}")
+        self.aux_names = tuple(aux_names)
 
         self.accelerator = Accelerator(split_batches=split_batches, mixed_precision=mixed_precision_type if amp else "no")
 
@@ -1846,17 +1919,7 @@ class Trainer:
 
         self.dice_metric = DiceMetric(include_background=False, reduction="mean_batch", ignore_empty=True, get_not_nans=False)
 
-        self._running = {
-            "ssim": 0.0,
-            "dice_iph": 0.0,
-            "dice_ivh": 0.0,
-            "vol_sim": 0.0,
-            "abs_vol_diff": 0.0,
-            "vol_sim_IPH": 0.0,
-            "abs_vol_diff_IPH": 0.0,
-            "vol_sim_IVH": 0.0,
-            "abs_vol_diff_IVH": 0.0,
-        }
+        self._running = {}
 
         self._n_batches = 0
         self.use_clinical = use_clinical
@@ -1893,58 +1956,52 @@ class Trainer:
         self.latent_mean = latent_mean
         self.latent_std = latent_std
 
-        self.ds = PairedNiftiSliceDataset(
-            slices_root=slices_root,
-            clinical_csv=clinical_csv,
-            image_size=dataset_image_size,
-            include_hospitals=train_hospitals,
-            keep_only_baseline_iph_slices=False,
-            augment_flip=augment_flip,
-            augment_rotation=augment_rotation,
-            rotation_range_deg=rotation_range,
-            use_clinical=self.use_clinical,
-            context_slices=self.context_slices,
-            context_mm_step=self.context_slice_mm,
-            slice_thickness_csv=self.slice_thickness_csv,
-            default_slice_thickness_mm=default_slice_thickness_mm,
-            ct_do_window=ct_do_window,
-            ct_window_min=ct_window_min,
-            ct_window_max=ct_window_max,
-        )
-
-        val_ds = PairedNiftiSliceDataset(
-            slices_root=slices_root,
-            clinical_csv=clinical_csv,
-            image_size=dataset_image_size,
-            include_hospitals=val_hospitals,
-            keep_only_baseline_iph_slices=False,
-            augment_flip=False,
-            augment_rotation=False,
-            rotation_range_deg=0.0,
-            use_clinical=self.use_clinical,
-            context_slices=self.context_slices,
-            context_mm_step=self.context_slice_mm,
-            slice_thickness_csv=self.slice_thickness_csv,
-            default_slice_thickness_mm=default_slice_thickness_mm,
-            ct_do_window=ct_do_window,
-            ct_window_min=ct_window_min,
-            ct_window_max=ct_window_max,
-        )
+        if self.dataset_kind == "nlst":
+            self.ds, val_ds = self._build_nlst_datasets(
+                base_path=nlst_base_path,
+                train_split=nlst_train_split,
+                val_split=nlst_val_split,
+                image_size=dataset_image_size,
+                selected_features=nlst_selected_features,
+                excluded_features=nlst_excluded_features,
+                normalize_clinical=nlst_normalize_clinical,
+                clinical_mean=nlst_clinical_mean,
+                clinical_std=nlst_clinical_std,
+                augment_flip=augment_flip,
+                augment_rotation=augment_rotation,
+                rotation_range_deg=rotation_range,
+            )
+        else:
+            self.ds, val_ds = self._build_nifti_datasets(
+                slices_root=slices_root,
+                clinical_csv=clinical_csv,
+                image_size=dataset_image_size,
+                train_hospitals=train_hospitals,
+                val_hospitals=val_hospitals,
+                augment_flip=augment_flip,
+                augment_rotation=augment_rotation,
+                rotation_range_deg=rotation_range,
+                default_slice_thickness_mm=default_slice_thickness_mm,
+                ct_do_window=ct_do_window,
+                ct_window_min=ct_window_min,
+                ct_window_max=ct_window_max,
+            )
 
         self.val_ds = val_ds
 
-        train_patients = sorted({s["patient_key"] for s in self.ds.samples})
-        val_patients = sorted({s["patient_key"] for s in val_ds.samples})
+        # Non-image channels the AE reconstructs alongside the image (2 for
+        # HemExp's iph/ivh, 0 for NLST). Everything seg-specific is gated here.
+        self.n_aux = int(getattr(self.ds, "n_aux", 2))
+        self.aux_names = self.aux_names[: self.n_aux]
 
-        print(f"Train: {len(self.ds)} slices | {len(train_patients)} patients")
-        print(f"Val:   {len(val_ds)} slices | {len(val_patients)} patients")
+        print(f"Train: {len(self.ds)} samples | Val: {len(val_ds)} samples | aux channels: {self.n_aux}")
 
         val_sampler = ExpansionBalancedSampler(val_ds, batch_size=self.batch_size, drop_last=False)
 
         val_loader = DataLoader(val_ds, batch_sampler=val_sampler, pin_memory=True, num_workers=worker_count)
         self.val_dl = self.accelerator.prepare(val_loader)
 
-        assert len(self.ds) >= 100
+        assert len(self.ds) >= self.batch_size, f"dataset has {len(self.ds)} samples, below one batch"
 
         sampler = ExpansionBalancedSampler(self.ds, batch_size=train_batch_size)
 
@@ -1996,6 +2053,119 @@ class Trainer:
 
             wandb.watch(self.model, log="all", log_freq=500)
 
+    def _build_nifti_datasets(
+        self,
+        slices_root,
+        clinical_csv,
+        image_size,
+        train_hospitals,
+        val_hospitals,
+        augment_flip,
+        augment_rotation,
+        rotation_range_deg,
+        default_slice_thickness_mm,
+        ct_do_window,
+        ct_window_min,
+        ct_window_max,
+    ):
+        """HemExp's original per-slice NIfTI hemorrhage datasets."""
+        common = dict(
+            slices_root=slices_root,
+            clinical_csv=clinical_csv,
+            image_size=image_size,
+            keep_only_baseline_iph_slices=False,
+            use_clinical=self.use_clinical,
+            context_slices=self.context_slices,
+            context_mm_step=self.context_slice_mm,
+            slice_thickness_csv=self.slice_thickness_csv,
+            default_slice_thickness_mm=default_slice_thickness_mm,
+            ct_do_window=ct_do_window,
+            ct_window_min=ct_window_min,
+            ct_window_max=ct_window_max,
+        )
+
+        train_ds = PairedNiftiSliceDataset(
+            include_hospitals=train_hospitals,
+            augment_flip=augment_flip,
+            augment_rotation=augment_rotation,
+            rotation_range_deg=rotation_range_deg,
+            **common,
+        )
+        val_ds = PairedNiftiSliceDataset(
+            include_hospitals=val_hospitals,
+            augment_flip=False,
+            augment_rotation=False,
+            rotation_range_deg=0.0,
+            **common,
+        )
+        return train_ds, val_ds
+
+    def _build_nlst_datasets(
+        self,
+        base_path,
+        train_split,
+        val_split,
+        image_size,
+        selected_features,
+        excluded_features,
+        normalize_clinical,
+        clinical_mean,
+        clinical_std,
+        augment_flip,
+        augment_rotation,
+        rotation_range_deg,
+    ):
+        """Paired NLST nodule datasets (year-1 -> year-2).
+
+        Clinical z-scoring statistics are fitted on the TRAIN split and reused
+        verbatim for validation, so no validation statistic leaks into training.
+        """
+        from nlst_dataset import NLSTPairedDataset
+
+        if base_path is None:
+            raise ValueError("dataset_kind='nlst' requires nlst_base_path")
+
+        common = dict(
+            base_path=base_path,
+            image_size=image_size,
+            context_slices=self.context_slices,
+            selected_features=selected_features,
+            excluded_features=excluded_features,
+        )
+
+        train_ds = NLSTPairedDataset(
+            split=train_split,
+            augment_flip=augment_flip,
+            augment_rotation=augment_rotation,
+            rotation_range_deg=rotation_range_deg,
+            **common,
+        )
+        val_ds = NLSTPairedDataset(
+            split=val_split,
+            augment_flip=False,
+            augment_rotation=False,
+            rotation_range_deg=0.0,
+            **common,
+        )
+
+        if normalize_clinical:
+            if clinical_mean is not None and clinical_std is not None:
+                mean, std = np.asarray(clinical_mean), np.asarray(clinical_std)
+            else:
+                mean, std = train_ds.compute_clinical_stats()
+            train_ds.set_clinical_stats(mean, std)
+            val_ds.set_clinical_stats(mean, std)
+            self.clinical_mean = [float(v) for v in mean]
+            self.clinical_std = [float(v) for v in std]
+            print(f"Clinical features ({len(train_ds.feature_names)}): {train_ds.feature_names}")
+            print(f"Clinical mean: {self.clinical_mean}")
+            print(f"Clinical std:  {self.clinical_std}")
+        else:
+            self.clinical_mean = self.clinical_std = None
+
+        self.clinical_feature_names = list(train_ds.feature_names)
+        return train_ds, val_ds
+
     @torch.no_grad()
     def _compute_batch_metrics(self, real_ct: torch.Tensor, fake_ct: torch.Tensor, real_seg: torch.Tensor, fake_seg: torch.Tensor):
         self.dice_metric.reset()
@@ -2024,93 +2194,105 @@ class Trainer:
 
         return ssim_val, dice_val, vol_sim_val, abs_vol_diff_val
 
+    # -------------------------------------------------------------- encoding
+
+    def _encode_pair(self, bl, fu, aux_bl, aux_fu):
+        """Normalized baseline/follow-up latents plus the centre baseline latent.
+
+        cond_z is the K-plane baseline stack the UNet concatenates as
+        conditioning; base_z is its centre plane -- the reference the delta
+        objective predicts against.
+        """
+        K, mid = self.context_slices, self.context_slices // 2
+
+        cond_z = encode_stack_chunked(self.model.autoencoder, bl, aux_bl)
+        target_z = encode_center(self.model.autoencoder, fu, aux_fu, mid)
+
+        cond_z = norm_latent(cond_z, self.latent_mean, self.latent_std, repeat_k=K)
+        target_z = norm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
+
+        return cond_z, target_z, extract_center_latent_from_stack(cond_z, K)
+
+    def _sample_and_decode(self, sampler_model, cond_z, target_z, base_z, clinical_vars, flag):
+        gen_pred = sampler_model.sample_conditioned(
+            cond_img=cond_z, seg=None, clinical_vars=clinical_vars, expansion_flag=flag
+        )
+        gen_z = gen_pred + base_z if self.latent_predict_delta else gen_pred
+
+        gen = self.model.autoencoder.decode(unnorm_latent(gen_z, self.latent_mean, self.latent_std, repeat_k=1))
+        real = self.model.autoencoder.decode(unnorm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1))
+        return gen, real
+
+    # --------------------------------------------------------------- metrics
+
     @torch.no_grad()
-    def run_train_metrics(self, bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_variables, expansion_flag, milestone):
+    def _image_and_aux_metrics(self, real, gen):
+        """SSIM on the image channel, plus per-aux-channel Dice / volume stats.
+
+        With n_aux == 0 (NLST) only SSIM is defined, so the segmentation
+        entries are absent from the dict rather than reported as zeros.
+        """
+        out = {"ssim": float(self.ssim(gen[:, 0:1], real[:, 0:1]).item())}
+
+        for a in range(self.n_aux):
+            c = 1 + a
+            name = self.aux_names[a]
+            _ssim, dice, vol_sim, abs_vd = self._compute_batch_metrics(
+                real[:, 0:1], gen[:, 0:1], real[:, c : c + 1], gen[:, c : c + 1]
+            )
+            out[f"dice_{name}"] = dice
+            out[f"vol_sim_{name}"] = vol_sim
+            out[f"abs_vol_diff_{name}"] = abs_vd
+
+        return out
+
+    def _save_panel(self, milestone, cond, gen, real):
+        """Write cond / prediction / target PNGs for the image and each aux channel."""
+        utils.save_image(cond[:, 0:1], self.results_folder / f"{milestone}_sample-img_cond.png")
+        utils.save_image(gen[:, 0:1], self.results_folder / f"{milestone}_sample-img_pred.png")
+        utils.save_image(real[:, 0:1], self.results_folder / f"{milestone}_sample-img_target.png")
+
+        for a in range(self.n_aux):
+            c = 1 + a
+            name = self.aux_names[a]
+            utils.save_image(cond[:, c : c + 1], self.results_folder / f"{milestone}_sample-{name}_cond.png")
+            utils.save_image((gen[:, c : c + 1] > 0.5).float(), self.results_folder / f"{milestone}_sample-{name}_pred.png")
+            utils.save_image(real[:, c : c + 1], self.results_folder / f"{milestone}_sample-{name}_target.png")
+
+    @torch.no_grad()
+    def run_train_metrics(self, bl, fu, aux_bl, aux_fu, clinical_variables, expansion_flag, milestone):
         device = self.device
-        K = self.context_slices
-        mid = K // 2
+        K, mid = self.context_slices, self.context_slices // 2
 
-        bl_ct = bl_ct.to(device)
-        fu_ct = fu_ct.to(device)
-        bl_iph = bl_iph.to(device)
-        bl_ivh = bl_ivh.to(device)
-        fu_iph = fu_iph.to(device)
-        fu_ivh = fu_ivh.to(device)
-
+        bl, fu, aux_bl, aux_fu = (t.to(device) for t in (bl, fu, aux_bl, aux_fu))
         clinical_variables = clinical_variables.to(device)
         expansion_flag = expansion_flag.to(device)
 
         if self.use_latent_diffusion:
-            cond_z = encode_triplet_stack_chunked(self.model.autoencoder, bl_ct, bl_iph, bl_ivh)
-            target_z = encode_center_triplet(self.model.autoencoder, fu_ct, fu_iph, fu_ivh, mid=mid)
-
-            cond_z = norm_latent(cond_z, self.latent_mean, self.latent_std, repeat_k=K)
-            target_z = norm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
-
-            gen_pred = self.ema.ema_model.sample_conditioned(cond_img=cond_z, seg=None, clinical_vars=clinical_variables, expansion_flag=expansion_flag)
-
-            base_z = extract_center_latent_from_stack(cond_z, K)
-
-            gen_z = gen_pred + base_z if self.latent_predict_delta else gen_pred
-
-            gen_native = unnorm_latent(gen_z, self.latent_mean, self.latent_std, repeat_k=1)
-            real_native = unnorm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
+            cond_z, target_z, base_z = self._encode_pair(bl, fu, aux_bl, aux_fu)
+            gen, real = self._sample_and_decode(
+                self.ema.ema_model, cond_z, target_z, base_z, clinical_variables, expansion_flag
+            )
             cond_native = unnorm_latent(cond_z, self.latent_mean, self.latent_std, repeat_k=K)
-
-            gen = self.model.autoencoder.decode(gen_native)
-            real = self.model.autoencoder.decode(real_native)
             cond = decode_center_from_stack(self.model.autoencoder, cond_native, K)
-
         else:
-            cond_img_pix = torch.cat([bl_ct, bl_iph, bl_ivh], dim=1)
-            real = torch.cat([fu_ct[:, mid : mid + 1], fu_iph[:, mid : mid + 1], fu_ivh[:, mid : mid + 1]], dim=1)
-            cond = torch.cat([bl_ct[:, mid : mid + 1], bl_iph[:, mid : mid + 1], bl_ivh[:, mid : mid + 1]], dim=1)
-
+            real = _plane(fu, aux_fu, mid)
+            cond = _plane(bl, aux_bl, mid)
             gen = self.ema.ema_model.sample_conditioned(
-                cond_img=cond_img_pix, seg=None, clinical_vars=clinical_variables, expansion_flag=expansion_flag
-            ).clamp(0, 1)
+                cond_img=_flatten_planes(bl, aux_bl), seg=None,
+                clinical_vars=clinical_variables, expansion_flag=expansion_flag,
+            )
 
-        real_ct, real_iph, real_ivh = real[:, 0:1], real[:, 1:2], real[:, 2:3]
-        gen_ct, gen_iph, gen_ivh = gen[:, 0:1], gen[:, 1:2], gen[:, 2:3]
+        gen, real, cond = gen.clamp(0, 1), real.clamp(0, 1), cond.clamp(0, 1)
 
-        ssim_b, dice_iph, vs_IPH, abs_vd_IPH = self._compute_batch_metrics(real_ct, gen_ct, real_iph, gen_iph)
-        ssim_b, dice_ivh, vs_IVH, abs_vd_IVH = self._compute_batch_metrics(real_ct, gen_ct, real_ivh, gen_ivh)
-
-        self._running["ssim"] += ssim_b
-        self._running["dice_iph"] += dice_iph
-        self._running["dice_ivh"] += dice_ivh
-        self._running["vol_sim_IPH"] += vs_IPH
-        self._running["abs_vol_diff_IPH"] += abs_vd_IPH
-        self._running["vol_sim_IVH"] += vs_IVH
-        self._running["abs_vol_diff_IVH"] += abs_vd_IVH
+        metrics = self._image_and_aux_metrics(real, gen)
+        for k, v in metrics.items():
+            self._running[k] = self._running.get(k, 0.0) + v
         self._n_batches += 1
 
-        avg = {k: self._running[k] / self._n_batches for k in self._running}
+        wandb.log({f"train/{k}": self._running[k] / self._n_batches for k in metrics}, step=self.step)
 
-        wandb.log(
-            {
-                "train/ssim": avg["ssim"],
-                "train/dice_iph": avg["dice_iph"],
-                "train/dice_ivh": avg["dice_ivh"],
-                "train/vol_sim_IPH": avg["vol_sim_IPH"],
-                "train/vol_sim_IVH": avg["vol_sim_IVH"],
-                "train/abs_vol_diff_IPH": avg["abs_vol_diff_IPH"],
-                "train/abs_vol_diff_IVH": avg["abs_vol_diff_IVH"],
-            },
-            step=self.step,
-        )
-
-        utils.save_image(cond[:, 0:1], self.results_folder / f"{milestone}_sample-img-ct_cond.png")
-        utils.save_image(cond[:, 1:2], self.results_folder / f"{milestone}_sample-img-seg1_cond.png")
-        utils.save_image(cond[:, 2:3], self.results_folder / f"{milestone}_sample-img-seg2_cond.png")
-
-        utils.save_image(gen_ct, self.results_folder / f"{milestone}_sample-img-ct_pred.png")
-        utils.save_image((gen_iph > 0.5).float(), self.results_folder / f"{milestone}_sample-img-seg1_pred.png")
-        utils.save_image((gen_ivh > 0.5).float(), self.results_folder / f"{milestone}_sample-img-seg2_pred.png")
-
-        utils.save_image(real_ct, self.results_folder / f"{milestone}_sample-img-ct_target.png")
-        utils.save_image(real_iph, self.results_folder / f"{milestone}_sample-img-seg1_target.png")
-        utils.save_image(real_ivh, self.results_folder / f"{milestone}_sample-img-seg2_target.png")
+        self._save_panel(milestone, cond, gen, real)
 
     @torch.no_grad()
     def run_validation(self, milestone):
@@ -2123,50 +2305,7 @@ class Trainer:
         sampler_model = self.ema.ema_model if (USE_EMA and hasattr(self, "ema")) else self.model
         sampler_model.eval()
 
-        exp_idx = []
-        stab_by_pk = {}
-
-        for i, s in enumerate(val_ds.samples):
-            pk = s["patient_key"]
-            exp = val_ds.metadata_expansion.get(pk, 0)
-            exp_int = 0 if pd.isna(exp) else int(exp)
-            exp_int = 1 if exp_int == 1 else 0
-
-            if exp_int == 1:
-                exp_idx.append(i)
-            else:
-                stab_by_pk.setdefault(pk, []).append(i)
-
-        exp_idx = sorted(exp_idx)
-        for pk in stab_by_pk:
-            stab_by_pk[pk] = sorted(stab_by_pk[pk])
-
-        if len(exp_idx) == 0:
-            raise RuntimeError("Validation set has 0 expansion slices.")
-
-        N = len(exp_idx)
-        total_stab = sum(len(v) for v in stab_by_pk.values())
-        if total_stab < N:
-            raise RuntimeError(f"Not enough non-expansion slices to match expansion slices: {total_stab} < {N}")
-
-        stab_pks = sorted(stab_by_pk.keys())
-        ptr = {pk: 0 for pk in stab_pks}
-        stab_sel = []
-
-        while len(stab_sel) < N:
-            picked_any = False
-            for pk in stab_pks:
-                j = ptr[pk]
-                if j < len(stab_by_pk[pk]):
-                    stab_sel.append(stab_by_pk[pk][j])
-                    ptr[pk] = j + 1
-                    picked_any = True
-                    if len(stab_sel) == N:
-                        break
-            if not picked_any:
-                raise RuntimeError("Round-robin selection got stuck (unexpected).")
-
-        eval_idx = exp_idx + stab_sel
+        eval_idx = self._balanced_val_indices(val_ds)
 
         bs = int(self.batch_size)
         batches = [eval_idx[i : i + bs] for i in range(0, len(eval_idx), bs)]
@@ -2174,76 +2313,77 @@ class Trainer:
         val_loader = DataLoader(val_ds, batch_sampler=batches, pin_memory=True, num_workers=worker_count)
         val_loader = self.accelerator.prepare(val_loader)
 
+        totals = {}
         total = 0
-        sum_ssim = 0.0
-        sum_dice_iph = sum_vs_iph = sum_abs_iph = 0.0
-        sum_dice_ivh = sum_vs_ivh = sum_abs_ivh = 0.0
-
-        K = self.context_slices
-        mid = K // 2
+        mid = self.context_slices // 2
         device = self.device
 
-        for bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_vars, expansion_flag in val_loader:
-            bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_vars, expansion_flag = (
-                t.to(device) for t in (bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_vars, expansion_flag)
+        for bl, fu, aux_bl, aux_fu, clinical_vars, expansion_flag in val_loader:
+            bl, fu, aux_bl, aux_fu, clinical_vars, expansion_flag = (
+                t.to(device) for t in (bl, fu, aux_bl, aux_fu, clinical_vars, expansion_flag)
             )
             expansion_flag = expansion_flag.squeeze(1)
 
             if self.use_latent_diffusion:
-                cond_z = encode_triplet_stack_chunked(self.model.autoencoder, bl_ct, bl_iph, bl_ivh)
-                target_z = encode_center_triplet(self.model.autoencoder, fu_ct, fu_iph, fu_ivh, mid=mid)
-
-                cond_z = norm_latent(cond_z, self.latent_mean, self.latent_std, repeat_k=K)
-                target_z = norm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
-
-                gen_pred = sampler_model.sample_conditioned(cond_img=cond_z, seg=None, clinical_vars=clinical_vars, expansion_flag=expansion_flag)
-
-                base_z = extract_center_latent_from_stack(cond_z, K)
-                gen_z = gen_pred + base_z if self.latent_predict_delta else gen_pred
-
-                gen_native = unnorm_latent(gen_z, self.latent_mean, self.latent_std, repeat_k=1)
-                real_native = unnorm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
-
-                gen = self.model.autoencoder.decode(gen_native)
-                real = self.model.autoencoder.decode(real_native)
+                cond_z, target_z, base_z = self._encode_pair(bl, fu, aux_bl, aux_fu)
+                gen, real = self._sample_and_decode(
+                    sampler_model, cond_z, target_z, base_z, clinical_vars, expansion_flag
+                )
             else:
-                cond_img_pix = torch.cat([bl_ct, bl_iph, bl_ivh], dim=1)
-                real = torch.cat([fu_ct[:, mid : mid + 1], fu_iph[:, mid : mid + 1], fu_ivh[:, mid : mid + 1]], dim=1)
-
-                gen = sampler_model.sample_conditioned(cond_img=cond_img_pix, seg=None, clinical_vars=clinical_vars, expansion_flag=expansion_flag)
+                real = _plane(fu, aux_fu, mid)
+                gen = sampler_model.sample_conditioned(
+                    cond_img=_flatten_planes(bl, aux_bl), seg=None,
+                    clinical_vars=clinical_vars, expansion_flag=expansion_flag,
+                )
 
             gen = gen.clamp(0, 1)
             real = real.clamp(0, 1)
 
             B = int(gen.shape[0])
             total += B
+            for k, v in self._image_and_aux_metrics(real, gen).items():
+                totals[k] = totals.get(k, 0.0) + v * B
 
-            real_ct, real_iph, real_ivh = real[:, 0:1], real[:, 1:2], real[:, 2:3]
-            gen_ct, gen_iph, gen_ivh = gen[:, 0:1], gen[:, 1:2], gen[:, 2:3]
+        wandb.log({f"val/{k}": v / total for k, v in totals.items()}, step=self.step)
 
-            ssim_iph, dice_iph, vs_iph, abs_iph = self._compute_batch_metrics(real_ct, gen_ct, real_iph, gen_iph)
-            ssim_ivh, dice_ivh, vs_ivh, abs_ivh = self._compute_batch_metrics(real_ct, gen_ct, real_ivh, gen_ivh)
+    def _balanced_val_indices(self, val_ds):
+        """Every positive sample plus an equal number of negatives.
 
-            sum_ssim += ssim_iph * B
-            sum_dice_iph += dice_iph * B
-            sum_vs_iph += vs_iph * B
-            sum_abs_iph += abs_iph * B
-            sum_dice_ivh += dice_ivh * B
-            sum_vs_ivh += vs_ivh * B
-            sum_abs_ivh += abs_ivh * B
+        Negatives are drawn round-robin over patients (where the dataset
+        exposes a patient key) so one over-represented patient cannot dominate
+        the comparison set.
+        """
+        flags = dataset_flags(val_ds)
+        samples = getattr(val_ds, "samples", None)
 
-        wandb.log(
-            {
-                "val/ssim": sum_ssim / total,
-                "val/dice_iph": sum_dice_iph / total,
-                "val/dice_ivh": sum_dice_ivh / total,
-                "val/vol_sim_iph": sum_vs_iph / total,
-                "val/vol_sim_ivh": sum_vs_ivh / total,
-                "val/abs_vol_diff_iph": sum_abs_iph / total,
-                "val/abs_vol_diff_ivh": sum_abs_ivh / total,
-            },
-            step=self.step,
-        )
+        pos_idx = [i for i, f in enumerate(flags) if f == 1]
+        if not pos_idx:
+            raise RuntimeError("Validation set has 0 positive samples.")
+
+        neg_by_group = {}
+        for i, f in enumerate(flags):
+            if f == 1:
+                continue
+            group = samples[i].get("patient_key", i) if samples is not None else i
+            neg_by_group.setdefault(group, []).append(i)
+
+        N = len(pos_idx)
+        total_neg = sum(len(v) for v in neg_by_group.values())
+        if total_neg < N:
+            raise RuntimeError(f"Not enough negative samples to match positives: {total_neg} < {N}")
+
+        groups = sorted(neg_by_group.keys(), key=str)
+        ptr = {g: 0 for g in groups}
+        neg_sel = []
+        while len(neg_sel) < N:
+            for g in groups:
+                if ptr[g] < len(neg_by_group[g]):
+                    neg_sel.append(neg_by_group[g][ptr[g]])
+                    ptr[g] += 1
+                    if len(neg_sel) == N:
+                        break
+
+        return sorted(pos_idx) + neg_sel
 
     @property
     def device(self):
@@ -2296,26 +2436,19 @@ class Trainer:
                 total_loss = 0.0
 
                 for _ in range(self.gradient_accumulate_every):
-                    bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_variables, expansion_flag = next(self.dl)
+                    bl, fu, aux_bl, aux_fu, clinical_variables, expansion_flag = next(self.dl)
 
-                    bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh = (t.to(device) for t in (bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh))
+                    bl, fu, aux_bl, aux_fu = (t.to(device) for t in (bl, fu, aux_bl, aux_fu))
 
                     clinical_variables = clinical_variables.to(device)
                     expansion_flag = expansion_flag.to(device).squeeze(1)
 
-                    K = self.context_slices
-                    mid = K // 2
+                    mid = self.context_slices // 2
 
                     with self.accelerator.autocast():
                         if self.use_latent_diffusion:
                             with torch.no_grad():
-                                cond_z = encode_triplet_stack_chunked(self.model.autoencoder, bl_ct, bl_iph, bl_ivh)
-                                target_z = encode_center_triplet(self.model.autoencoder, fu_ct, fu_iph, fu_ivh, mid=mid)
-
-                                cond_z = norm_latent(cond_z, self.latent_mean, self.latent_std, repeat_k=K)
-                                target_z = norm_latent(target_z, self.latent_mean, self.latent_std, repeat_k=1)
-
-                            base_z = extract_center_latent_from_stack(cond_z, K)
+                                cond_z, target_z, base_z = self._encode_pair(bl, fu, aux_bl, aux_fu)
 
                             if self.latent_predict_delta:
                                 diffusion_target = target_z - base_z
@@ -2325,13 +2458,12 @@ class Trainer:
                             loss = self.model(diffusion_target, cond_img=cond_z, clinical_vars=clinical_variables, expansion_flag=expansion_flag)
 
                         else:
-                            cond_img_pix = torch.cat([bl_ct, bl_iph, bl_ivh], dim=1)
-
-                            target_center = torch.cat(
-                                [fu_ct[:, mid : mid + 1], fu_iph[:, mid : mid + 1], fu_ivh[:, mid : mid + 1]], dim=1
+                            loss = self.model(
+                                _plane(fu, aux_fu, mid),
+                                cond_img=_flatten_planes(bl, aux_bl),
+                                clinical_vars=clinical_variables,
+                                expansion_flag=expansion_flag,
                             )
-
-                            loss = self.model(target_center, cond_img=cond_img_pix, clinical_vars=clinical_variables, expansion_flag=expansion_flag)
 
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
@@ -2360,7 +2492,7 @@ class Trainer:
                             milestone = self.step // self.save_and_sample_every
 
                             self.run_train_metrics(
-                                bl_ct, fu_ct, bl_iph, bl_ivh, fu_iph, fu_ivh, clinical_variables, expansion_flag, milestone
+                                bl, fu, aux_bl, aux_fu, clinical_variables, expansion_flag, milestone
                             )
                             self.run_validation(milestone)
                             self.save(milestone)

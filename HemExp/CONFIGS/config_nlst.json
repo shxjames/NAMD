@@ -1,0 +1,82 @@
+{
+  "run": {
+    "name": "config_nlst",
+    "results_root": "./results",
+    "seed": 123,
+    "wandb": {
+      "enabled": true,
+      "project": "HEMEXP-NLST",
+      "entity": null
+    }
+  },
+
+  "data": {
+    "kind": "nlst",
+    "nlst_base_path": "../NLST_with_second_large_cleaned",
+    "nlst_train_split": "train",
+    "nlst_val_split": "val",
+
+    "_comment_features": "FIRST-YEAR features only, enforced in nlst_dataset.py. Default exclusions drop the two identifiers; the label reaches the model through the expansion-flag embedding instead of the clinical vector. For literal NAMD parity set excluded_features to [] and clinical_dim to 16 (matches ehr_encoder.EHREncoder in_dim=16).",
+    "excluded_features": ["unique_ids", "year", "label"],
+    "selected_features": null,
+    "normalize_clinical": true,
+
+    "augment": {
+      "flip": true,
+      "rotation": false,
+      "rotation_range_deg": 0
+    }
+  },
+
+  "ae": {
+    "use_latent_diffusion": true,
+    "ae_ckpt": "output/autoencoder_nlst/checkpoints/checkpoint_step_20000.pth",
+    "in_channels": 1,
+    "head_names": ["ct"],
+    "channels": [64, 128, 256],
+    "ae_input_size": 128,
+    "latent_size": 32,
+    "latent_channels": 4,
+
+    "_comment_stats": "REPLACE with the output of compute_latent_stats.py for THIS autoencoder checkpoint. The placeholders below are identity whitening and will train, but badly scaled.",
+    "mean": [0.0, 0.0, 0.0, 0.0],
+    "std": [1.0, 1.0, 1.0, 1.0]
+  },
+
+  "model": {
+    "dim": 96,
+    "dim_mults": [1, 2, 4, 8],
+    "channels": 4,
+    "flash_attn": false,
+    "dropout": 0,
+    "use_clinical": true,
+    "clinical_dim": 13,
+    "use_expansion_flag_input": true,
+    "clinical_drop_prob": 0.1,
+    "expansion_flag_drop_prob": 0.0,
+    "context_slices": 1
+  },
+
+  "diffusion": {
+    "timesteps": 1000,
+    "sampling_timesteps": 250,
+    "objective": "pred_v",
+    "beta_schedule": "sigmoid",
+    "ddim_eta": 0,
+    "min_snr_loss_weight": true,
+    "min_snr_gamma": 1,
+    "segmentation_loss_weight": 0.0,
+    "latent_predict_delta": true
+  },
+
+  "train": {
+    "batch_size": 16,
+    "grad_accum": 1,
+    "lr": 0.0001,
+    "steps": 20000,
+    "ema_decay": 0.995,
+    "amp": true,
+    "save_every": 1000,
+    "resume_checkpoint": null
+  }
+}

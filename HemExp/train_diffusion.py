@@ -1,11 +1,15 @@
 from denoising_diffusion_pytorch import MultiHeadAEKL, Unet, GaussianDiffusion, Trainer
 import os
+import sys
 import json
 import time
 import random
 import numpy as np
 import torch
 import argparse
+
+# Make `nlst_dataset` importable no matter where the script is launched from.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
@@ -56,18 +60,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 use_latent = bool(cfg_ae["use_latent_diffusion"])
 
+# Output heads of the first stage. HemExp reconstructs (ct, iph, ivh); NLST has
+# no segmentations and trains a single-channel AE.
+ae_head_names = tuple(cfg_ae.get("head_names", ["ct", "iph", "ivh"]))
+aux_names = ae_head_names[1:]
+
 if use_latent:
     ae = MultiHeadAEKL(
         spatial_dims=2,
-        in_channels=3,
-        channels=(64, 128, 256),
+        in_channels=int(cfg_ae.get("in_channels", len(ae_head_names))),
+        channels=tuple(cfg_ae.get("channels", [64, 128, 256])),
         latent_channels=int(cfg_ae["latent_channels"]),
         num_res_blocks=2,
         norm_num_groups=32,
         attention_levels=(False, False, False),
+        head_names=ae_head_names,
     ).to(device)
 
-    ckpt = torch.load(cfg_ae["ae_ckpt"], map_location=device)
+    ckpt = torch.load(cfg_ae["ae_ckpt"], map_location=device, weights_only=False)
     ae.load_state_dict(ckpt["model_state_dict"])
     ae.eval()
     for p in ae.parameters():
@@ -81,6 +91,7 @@ model = Unet(
     flash_attn=bool(cfg_model.get("flash_attn", False)),
     channels=int(cfg_model["channels"]),
     use_clinical=bool(cfg_model["use_clinical"]),
+    clinical_dim=int(cfg_model.get("clinical_dim", 7)),
     use_expansion_flag_input=bool(cfg_model["use_expansion_flag_input"]),
     predict_segmentation=False,
     use_latent_diffusion=use_latent,
@@ -110,7 +121,7 @@ diffusion = GaussianDiffusion(
 
 trainer = Trainer(
     diffusion,
-    clinical_csv=cfg_data["clinical_csv"],
+    clinical_csv=cfg_data.get("clinical_csv"),
     train_batch_size=int(cfg_train["batch_size"]),
     train_lr=float(cfg_train["lr"]),
     train_num_steps=int(cfg_train["steps"]),
@@ -126,20 +137,30 @@ trainer = Trainer(
     use_expansion_flag_input=bool(cfg_model["use_expansion_flag_input"]),
     use_latent_diffusion=use_latent,
     ae_input_size=int(cfg_ae["ae_input_size"]),
-    context_slices=int(cfg_model.get("context_slices")),
-    context_slice_mm=float(cfg_data["context_mm_step"]),
+    context_slices=int(cfg_model.get("context_slices", 1)),
+    context_slice_mm=float(cfg_data.get("context_mm_step", 5.0)),
     slice_thickness_csv=cfg_data.get("slice_thickness_csv", None),
     default_slice_thickness_mm=float(cfg_data.get("default_slice_thickness_mm", 5.0)),
     results_folder=results_folder,
     resume_checkpoint=cfg_train.get("resume_checkpoint", None),
     latent_mean=cfg_ae["mean"],
     latent_std=cfg_ae["std"],
-    slices_root=cfg_data["slices_root"],
-    train_hospitals=cfg_data["train_hospitals"],
-    val_hospitals=cfg_data["val_hospitals"],
-    ct_do_window=cfg_data["ct_do_window"],
-    ct_window_min=cfg_data["ct_window_min"],
-    ct_window_max=cfg_data["ct_window_max"],
+    slices_root=cfg_data.get("slices_root"),
+    train_hospitals=cfg_data.get("train_hospitals"),
+    val_hospitals=cfg_data.get("val_hospitals"),
+    ct_do_window=cfg_data.get("ct_do_window", True),
+    ct_window_min=cfg_data.get("ct_window_min", 0.0),
+    ct_window_max=cfg_data.get("ct_window_max", 100.0),
+    dataset_kind=cfg_data.get("kind", "nifti"),
+    nlst_base_path=cfg_data.get("nlst_base_path"),
+    nlst_train_split=cfg_data.get("nlst_train_split", "train"),
+    nlst_val_split=cfg_data.get("nlst_val_split", "val"),
+    nlst_selected_features=cfg_data.get("selected_features"),
+    nlst_excluded_features=cfg_data.get("excluded_features"),
+    nlst_normalize_clinical=bool(cfg_data.get("normalize_clinical", True)),
+    nlst_clinical_mean=cfg_data.get("clinical_mean"),
+    nlst_clinical_std=cfg_data.get("clinical_std"),
+    aux_names=aux_names,
 )
 
 trainer.train()
