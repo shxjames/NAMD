@@ -69,14 +69,18 @@
     "latent_predict_delta": true
   },
 
+  "_comment_budget": "One epoch is one pass of the balanced sampler = 2 * 725 majority samples = 91 steps at batch 16. `epochs` overrides `steps`. val/loss is evaluated every epoch (cheap, deterministic) and the best checkpoint is written to model-best.pt; the expensive sampling-based image metrics run on sample_metrics_every.",
+
   "train": {
     "batch_size": 16,
     "grad_accum": 1,
     "lr": 0.0001,
-    "steps": 20000,
+    "epochs": 150,
+    "val_every": null,
+    "sample_metrics_every": 2275,
     "ema_decay": 0.995,
     "amp": true,
-    "save_every": 1000,
+    "save_every": 455,
     "resume_checkpoint": null
   }
 }

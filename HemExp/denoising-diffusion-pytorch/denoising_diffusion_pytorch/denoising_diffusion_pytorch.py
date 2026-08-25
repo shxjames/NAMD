@@ -1892,6 +1892,10 @@ class Trainer:
         min_lesion_pixels_2d: int = 1,
         latent_mean=None,
         latent_std=None,
+        train_num_epochs=None,
+        val_every=None,
+        val_loss_seed: int = 1234,
+        sample_metrics_every=None,
         dataset_kind: str = "nifti",
         nlst_base_path: str = None,
         nlst_train_split: str = "train",
@@ -1938,7 +1942,11 @@ class Trainer:
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
 
+        # `train_num_epochs` wins when given; the step count is resolved once the
+        # sampler is built and an epoch's length is actually known.
+        self.train_num_epochs = train_num_epochs
         self.train_num_steps = train_num_steps
+        self.val_loss_seed = int(val_loss_seed)
         self.image_size = diffusion_model.image_size
 
         if self.use_latent_diffusion:
@@ -2008,6 +2016,33 @@ class Trainer:
         dl = DataLoader(self.ds, batch_sampler=sampler, pin_memory=True, num_workers=worker_count)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
+
+        # One epoch is one pass of the balanced sampler, which oversamples the
+        # minority class -- so it is 2 * majority_count samples, not len(ds).
+        self.steps_per_epoch = max(1, len(sampler) // self.gradient_accumulate_every)
+
+        if self.train_num_epochs is not None:
+            self.train_num_steps = int(self.train_num_epochs) * self.steps_per_epoch
+
+        # Validation loss is cheap (one forward per batch), so it runs every
+        # epoch by default. The sampling-based image metrics are far more
+        # expensive and stay on the checkpoint cadence.
+        self.val_every = int(val_every) if val_every else self.steps_per_epoch
+        self.sample_metrics_every = int(sample_metrics_every) if sample_metrics_every else save_and_sample_every
+
+        print(
+            f"{self.steps_per_epoch} steps/epoch -> training {self.train_num_steps} steps "
+            f"(~{self.train_num_steps / self.steps_per_epoch:.0f} epochs); "
+            f"val loss every {self.val_every}, image metrics every {self.sample_metrics_every}"
+        )
+
+        # A plain sequential pass for the loss curve: the balanced val loader
+        # oversamples positives, which would bias the reported number.
+        self.val_loss_dl = self.accelerator.prepare(
+            DataLoader(val_ds, batch_size=self.batch_size, shuffle=False,
+                       pin_memory=True, num_workers=worker_count)
+        )
+        self.best_val_loss = float("inf")
 
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
 
@@ -2295,6 +2330,64 @@ class Trainer:
         self._save_panel(milestone, cond, gen, real)
 
     @torch.no_grad()
+    def run_val_loss(self):
+        """Mean diffusion loss over the val split, on the training objective.
+
+        Deterministic by construction: timesteps and noise are drawn from a
+        fixed seed and classifier-free dropout is disabled, so successive
+        evaluations differ only because the weights changed. Without that the
+        curve is dominated by resampling noise and cannot be compared point to
+        point.
+        """
+        was_training = self.model.training
+        self.model.eval()
+
+        unet = self.accelerator.unwrap_model(self.model).model
+        saved_drop = getattr(unet, "clinical_drop_prob", None)
+        if saved_drop is not None:
+            unet.clinical_drop_prob = 0.0
+
+        device = self.device
+        mid = self.context_slices // 2
+        gen = torch.Generator(device="cpu").manual_seed(self.val_loss_seed)
+
+        model = self.accelerator.unwrap_model(self.model)
+        total, count = 0.0, 0
+
+        try:
+            for bl, fu, aux_bl, aux_fu, clinical_vars, expansion_flag in self.val_loss_dl:
+                bl, fu, aux_bl, aux_fu = (t.to(device) for t in (bl, fu, aux_bl, aux_fu))
+                clinical_vars = clinical_vars.to(device)
+                expansion_flag = expansion_flag.to(device).squeeze(1)
+
+                if self.use_latent_diffusion:
+                    cond_z, target_z, base_z = self._encode_pair(bl, fu, aux_bl, aux_fu)
+                    target = target_z - base_z if self.latent_predict_delta else target_z
+                    cond = cond_z
+                else:
+                    target = _plane(fu, aux_fu, mid)
+                    cond = _flatten_planes(bl, aux_bl)
+
+                b = target.shape[0]
+                t_idx = torch.randint(0, model.num_timesteps, (b,), generator=gen).to(device)
+                noise = torch.randn(target.shape, generator=gen).to(device)
+
+                loss = model.p_losses(
+                    model.normalize(target), t_idx, noise=noise, cond_img=cond,
+                    clinical_vars=clinical_vars, expansion_flag=expansion_flag,
+                )
+
+                total += float(loss.item()) * b
+                count += b
+        finally:
+            if saved_drop is not None:
+                unet.clinical_drop_prob = saved_drop
+            if was_training:
+                self.model.train()
+
+        return total / max(1, count)
+
+    @torch.no_grad()
     def run_validation(self, milestone):
         USE_EMA = True
 
@@ -2402,6 +2495,7 @@ class Trainer:
             "version": __version__,
         }
 
+        data["val_loss"] = self.best_val_loss
         torch.save(data, str(self.results_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone):
@@ -2471,6 +2565,7 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f"loss: {total_loss:.4f}")
+                epoch = self.step / self.steps_per_epoch
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -2485,16 +2580,32 @@ class Trainer:
                 if accelerator.is_main_process:
                     self.ema.update()
 
+                    wandb.log(
+                        {"train/loss": total_loss, "epoch": self.step / self.steps_per_epoch},
+                        step=self.step,
+                    )
+
+                    if self.step != 0 and divisible_by(self.step, self.val_every):
+                        val_loss = self.run_val_loss()
+                        wandb.log({"val/loss": val_loss}, step=self.step)
+                        pbar.set_description(f"loss: {total_loss:.4f} | val: {val_loss:.4f}")
+
+                        if val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                            self.save("best")
+                            wandb.log({"val/best_loss": val_loss}, step=self.step)
+
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
 
-                            self.run_train_metrics(
-                                bl, fu, aux_bl, aux_fu, clinical_variables, expansion_flag, milestone
-                            )
-                            self.run_validation(milestone)
+                            if divisible_by(self.step, self.sample_metrics_every):
+                                self.run_train_metrics(
+                                    bl, fu, aux_bl, aux_fu, clinical_variables, expansion_flag, milestone
+                                )
+                                self.run_validation(milestone)
                             self.save(milestone)
 
                 pbar.update(1)

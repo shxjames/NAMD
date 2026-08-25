@@ -69,7 +69,8 @@ DEFAULTS = {
     "norm_num_groups": 32,
     "batch_size": 16,
     "accumulate_grad_batches": 1,
-    "total_steps": 20000,
+    "total_epochs": 150,
+    "total_steps": None,
     "lr_g": 5e-5,
     "lr_d": 5e-6,
     "kl_weight": 1e-8,
@@ -84,6 +85,7 @@ DEFAULTS = {
     "num_workers": 8,
     "log_interval": 100,
     "save_interval": 1000,
+    "val_interval": None,
     "output_dir": "output/autoencoder_nlst",
     "resume_checkpoint": None,
     "seed": 123,
@@ -180,6 +182,29 @@ def log_reconstructions(model, loader, device, step, output_dir, max_images=8):
     return images, recon
 
 
+@torch.no_grad()
+def evaluate(model, loader, device, kl_weight):
+    """Mean reconstruction / KL loss over the validation split."""
+    was_training = model.training
+    model.eval()
+
+    recon_total, kl_total, n = 0.0, 0.0, 0
+    for batch in loader:
+        images = batch["image"].to(device)
+        recon, z_mu, z_sigma = model(images)
+        b = images.shape[0]
+        recon_total += float(((recon[:, 0:1] - images) ** 2).mean().item()) * b
+        kl_total += float(compute_kl(z_mu, z_sigma).item()) * b
+        n += b
+
+    if was_training:
+        model.train()
+
+    recon = recon_total / max(1, n)
+    kl = kl_total / max(1, n)
+    return {"val/recon": recon, "val/kl": kl, "val/loss": recon + kl_weight * kl}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train the NLST first-stage autoencoder")
     parser.add_argument("--config", type=str, default=None, help="Path to a JSON config file")
@@ -265,7 +290,17 @@ def main():
     optimizer_g = torch.optim.Adam(model.parameters(), lr=float(cfg["lr_g"]))
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=float(cfg["lr_d"]))
 
-    total_steps = int(cfg["total_steps"])
+    steps_per_epoch = max(1, len(train_loader) // int(cfg["accumulate_grad_batches"]))
+    if cfg.get("total_epochs"):
+        total_steps = int(cfg["total_epochs"]) * steps_per_epoch
+    else:
+        total_steps = int(cfg["total_steps"])
+    val_interval = int(cfg["val_interval"]) if cfg.get("val_interval") else steps_per_epoch
+    print(
+        f"{steps_per_epoch} steps/epoch -> training {total_steps} steps "
+        f"(~{total_steps / steps_per_epoch:.0f} epochs); val every {val_interval}"
+    )
+    best_val = float("inf")
     scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_g, T_max=total_steps)
     scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_d, T_max=total_steps)
 
@@ -361,6 +396,7 @@ def main():
                 n = max(1, accum["n"])
                 log_dict = {
                     "step": global_step,
+                    "epoch": global_step / steps_per_epoch,
                     "train/recon": accum["recon"] / n,
                     "train/kl": accum["kl"] / n,
                     "train/perceptual": accum["percept"] / n,
@@ -378,6 +414,36 @@ def main():
                     os.path.join(output_dir, "recons"),
                 )
                 accum = {k: 0.0 for k in accum}
+
+            if accelerator.is_main_process and global_step % val_interval == 0:
+                val_metrics = evaluate(
+                    accelerator.unwrap_model(model), val_loader, device, float(cfg["kl_weight"])
+                )
+                val_metrics["epoch"] = global_step / steps_per_epoch
+                if cfg["wandb_enabled"]:
+                    wandb.log(val_metrics, step=global_step)
+                print(
+                    f"  step {global_step} (epoch {val_metrics['epoch']:.1f}): "
+                    f"val recon {val_metrics['val/recon']:.6f}"
+                )
+
+                if val_metrics["val/loss"] < best_val:
+                    best_val = val_metrics["val/loss"]
+                    ckpt_dir = os.path.join(output_dir, "checkpoints")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    torch.save(
+                        {
+                            "global_step": global_step,
+                            "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                            "discriminator_state_dict": accelerator.unwrap_model(discriminator).state_dict(),
+                            "image_size": int(cfg["image_size"]),
+                            "latent_channels": int(cfg["latent_channels"]),
+                            "head_names": ["ct"],
+                            "in_channels": 1,
+                            "val_loss": best_val,
+                        },
+                        os.path.join(ckpt_dir, "checkpoint_best.pth"),
+                    )
 
             if accelerator.is_main_process and global_step % int(cfg["save_interval"]) == 0:
                 ckpt_dir = os.path.join(output_dir, "checkpoints")

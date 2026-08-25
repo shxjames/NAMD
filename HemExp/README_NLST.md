@@ -62,9 +62,9 @@ python compute_latent_stats.py \
 # 3. diffusion
 python train_diffusion.py CONFIGS/config_nlst.json
 
-# 4. inference (test split)
+# 4. inference (test split) -- model-best.pt is the lowest val/loss checkpoint
 python sample_nlst.py --config CONFIGS/config_nlst.json \
-    --ckpt results/<stamp>__config_nlst/model-20.pt --split test
+    --ckpt results/<stamp>__config_nlst/model-best.pt --split test
 ```
 
 Counterfactuals, HemExp's main clinical affordance:
@@ -96,13 +96,38 @@ New files: `nlst_dataset.py`, `train_autoencoder_nlst.py`, `compute_latent_stats
 
 `sampling.py` is untouched and still serves the hemorrhage path.
 
-## Notes before a real run
+## Training budget and loss tracking
 
-- **Scale.** 900 train pairs, one sample per patient — against HemExp's per-slice
-  corpus across many patients. `steps: 20000` at batch 16 is already ~350 epochs;
-  watch for overfitting and consider stronger augmentation or fewer steps.
-- **Class balance.** `ExpansionBalancedSampler` forces 50/50 batches, oversampling
-  the 175 positives roughly 4×. An epoch is `2 × 725` samples.
+Both stages are configured in **epochs**, not raw steps — an epoch's length is
+resolved once the sampler exists and is printed at startup.
+
+| | steps/epoch @ batch 16 | default | total steps |
+| --- | --- | --- | --- |
+| autoencoder | 112 (1800 images) | `total_epochs: 150` | 16800 |
+| diffusion | 91 (balanced sampler) | `epochs: 150` | 13650 |
+
+Set `total_steps` / `steps` instead if you want to pin the raw count; the epoch
+field takes precedence when both are present.
+
+Logged to wandb every step: `train/loss` and `epoch`. Every epoch:
+
+- **diffusion** — `val/loss`, the *training objective* evaluated on a plain
+  sequential pass of the val split. It is made deterministic on purpose:
+  timesteps and noise come from a fixed seed (`val_loss_seed`) and
+  classifier-free dropout is disabled, so successive points differ only because
+  the weights changed. Without that, resampling noise swamps the signal and the
+  curve cannot be read point to point. Best-so-far is written to `model-best.pt`.
+- **autoencoder** — `val/recon`, `val/kl`, `val/loss`; best to `checkpoint_best.pth`.
+
+The expensive sampling-based image metrics (SSIM, and Dice/volume on the
+hemorrhage path) still need a full reverse diffusion per batch, so they stay on
+the slower `sample_metrics_every` cadence — 25 epochs by default — while
+checkpoints are written every 5.
+
+Note the balanced sampler oversamples the 175 positives roughly 4×, so a
+diffusion epoch is `2 × 725 = 1450` samples rather than 900.
+
+## Notes before a real run
 - **Oracle flag.** Training conditions on the ground-truth malignancy label. That
   is intended for counterfactual simulation, but it makes any downstream
   "synthetic data improves a classifier" claim circular unless the generated set

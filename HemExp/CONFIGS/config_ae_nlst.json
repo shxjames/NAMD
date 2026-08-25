@@ -9,17 +9,21 @@
   "num_res_blocks": 2,
   "norm_num_groups": 32,
 
+  "_comment_budget": "1800 train images / batch 16 = 112 steps per epoch. `total_epochs` overrides `total_steps`. val/recon is evaluated every epoch and the best model is written to checkpoint_best.pth.",
+
   "batch_size": 16,
   "accumulate_grad_batches": 1,
-  "total_steps": 20000,
+  "total_epochs": 150,
+  "total_steps": null,
+  "val_interval": null,
   "lr_g": 5e-5,
   "lr_d": 5e-6,
 
   "kl_weight": 1e-8,
   "perceptual_weight": 0.001,
   "adversarial_weight": 0.005,
-  "warmup_steps_percept": 2500,
-  "warmup_steps_adv": 5000,
+  "warmup_steps_percept": 2240,
+  "warmup_steps_adv": 5600,
 
   "augment_flip": true,
   "augment_rotation": false,
