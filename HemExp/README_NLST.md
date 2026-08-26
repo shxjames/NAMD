@@ -89,6 +89,28 @@ re-pins the whole torch/CUDA stack. Note the entrypoints prepend the sibling
 pip-installed copy; don't rely on `pip install -e` pointing at the right
 checkout.
 
+### Comparing against the other NAMD arms
+
+`sample_nlst.py --export-triplets` writes the layout `nodule_quality_eval`
+consumes — one `(3, H, W)` uint8 `.npy` per sample per seed under
+`seed_<seed>/sample_<idx>_<label>.npy`, channels `[T0, T1_gen, T1_real]` —
+the same format `eval_all.py:export_eval_triplets` produces for every other arm:
+
+```bash
+python sample_nlst.py --config CONFIGS/config_nlst.json \
+    --ckpt $RUNS/diffusion/<stamp>__config_nlst/model-best.pt \
+    --split test --seeds 0 1 2 3 4 \
+    --export-triplets $RUNS/eval_triplets
+```
+
+Note the intensity convention differs from `eval_all.py`: that pipeline holds
+images in `[-1, 1]` and converts with `(x+1)/2`, while this one is `[0, 1]`
+throughout (HemExp windows CT to `[0, 1]`), so the export uses a plain `x*255`.
+Reusing eval_all's formula here would compress every image into the upper half
+of the range without erroring.
+
+When reporting downstream classifier numbers, use `avg_score`, not `avg_pred`.
+
 Counterfactuals, HemExp's main clinical affordance:
 
 ```bash
