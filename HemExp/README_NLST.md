@@ -49,23 +49,45 @@ val/test.
 Three stages. The autoencoder must be retrained — HemExp's released weights are
 3-channel 384px hemorrhage CT and do not transfer.
 
+### On SLURM (the way these were actually run)
+
 ```bash
-conda env create -f environment.yml && conda activate hemexp_demo
+AE=$(sbatch --parsable slurm/hemexp_nlst_ae.sh)
+sbatch --dependency=afterok:$AE slurm/hemexp_nlst_diffusion.sh
+```
+
+Stage 2 recomputes the latent statistics for the stage-1 checkpoint and writes
+them into `CONFIGS/config_nlst.json` itself, so there is no manual step between
+the jobs. Outputs land in `$RUNS = NAMD/HemExp_NLST_runs/`.
+
+### By hand
+
+```bash
+conda activate /scratch/liyues_root/liyues/shxjames/envs/HEMEXP
+RUNS=/scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs
 
 # 1. first stage: MultiHeadAEKL, in_channels=1, head_names=("ct",), 128px
 python train_autoencoder_nlst.py --config CONFIGS/config_ae_nlst.json
 
-# 2. latent statistics for THIS autoencoder -> paste into config_nlst.json's "ae"
+# 2. latent statistics for THIS autoencoder, written into the diffusion config
 python compute_latent_stats.py \
-    --ae-ckpt output/autoencoder_nlst/checkpoints/checkpoint_step_20000.pth
+    --ae-ckpt $RUNS/autoencoder/checkpoints/checkpoint_best.pth \
+    --update-config CONFIGS/config_nlst.json
 
 # 3. diffusion
 python train_diffusion.py CONFIGS/config_nlst.json
 
-# 4. inference (test split) -- model-best.pt is the lowest val/loss checkpoint
+# 4. inference -- model-best.pt is the lowest val/loss checkpoint
 python sample_nlst.py --config CONFIGS/config_nlst.json \
-    --ckpt results/<stamp>__config_nlst/model-best.pt --split test
+    --ckpt $RUNS/diffusion/<stamp>__config_nlst/model-best.pt --split test
 ```
+
+The env is `envs/HEMEXP` — the NAMD env cloned, plus `monai==1.5.2`,
+`ema-pytorch`, and `nibabel`. Building `environment.yml` fresh also works but
+re-pins the whole torch/CUDA stack. Note the entrypoints prepend the sibling
+`denoising-diffusion-pytorch/` to `sys.path` so the adapted fork wins over any
+pip-installed copy; don't rely on `pip install -e` pointing at the right
+checkout.
 
 Counterfactuals, HemExp's main clinical affordance:
 
