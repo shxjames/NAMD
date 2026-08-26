@@ -21,7 +21,12 @@ import sys
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# The vendored (adapted) fork must win over any pip-installed
+# denoising-diffusion-pytorch, including an editable install pointing at a
+# different checkout. Path order is the only thing that reliably guarantees it.
+sys.path.insert(0, os.path.join(_HERE, "denoising-diffusion-pytorch"))
+sys.path.insert(0, _HERE)
 
 from nlst_dataset import NLSTAutoencoderDataset
 from train_autoencoder_nlst import MultiHeadAEKL
