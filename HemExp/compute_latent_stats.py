@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--out", default=None, help="Optional path to write the stats as JSON")
+    parser.add_argument("--update-config", default=None,
+                        help="Diffusion config to write ae.mean / ae.std into, in place")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,6 +93,21 @@ def main():
         with open(args.out, "w") as f:
             json.dump(stats, f, indent=2)
         print(f"\nWrote {args.out}")
+
+    if args.update_config:
+        with open(args.update_config) as f:
+            cfg = json.load(f)
+        n = int(cfg["ae"]["latent_channels"])
+        if len(stats["mean"]) != n:
+            raise ValueError(
+                f"computed {len(stats['mean'])} latent channels but the config declares {n}"
+            )
+        cfg["ae"]["mean"] = stats["mean"]
+        cfg["ae"]["std"] = stats["std"]
+        cfg["ae"]["_comment_stats"] = f"Written by compute_latent_stats.py from {args.ae_ckpt}"
+        with open(args.update_config, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"Updated ae.mean / ae.std in {args.update_config}")
 
 
 if __name__ == "__main__":
