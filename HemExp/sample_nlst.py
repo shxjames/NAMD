@@ -61,7 +61,40 @@ def parse_args():
                    help="Force the oracle flag for every subject (counterfactual generation)")
     p.add_argument("--use-ema", action="store_true", default=True)
     p.add_argument("--limit", type=int, default=None, help="Only sample the first N subjects")
+    p.add_argument("--seeds", type=int, nargs="+", default=[0],
+                   help="Sampling seeds; one generation pass per seed, as eval_all.py does")
+    p.add_argument("--export-triplets", default=None,
+                   help="Directory for nodule_quality_eval-format triplets "
+                        "(seed_<seed>/sample_<idx>_<label>.npy, channels [T0, T1_gen, T1_real])")
     return p.parse_args()
+
+
+def export_triplets(out_dir, seed, baseline, generated, real, labels):
+    """Write per-sample uint8 triplets in the layout nodule_quality_eval expects.
+
+    Mirrors eval_all.py:export_eval_triplets so this arm drops into the same
+    harness as every other NAMD arm. One difference matters: eval_all's images
+    are in [-1, 1] and it rescales with (x+1)/2, whereas this pipeline works in
+    [0, 1] throughout (HemExp windows CT to [0, 1]), so the conversion here is a
+    plain x*255. Applying eval_all's formula would silently compress everything
+    into the upper half of the range.
+    """
+    seed_dir = os.path.join(out_dir, f"seed_{seed}")
+    os.makedirs(seed_dir, exist_ok=True)
+
+    def to_u8(a):
+        return (np.clip(a, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    for i in range(baseline.shape[0]):
+        trip = np.stack([
+            to_u8(baseline[i, 0]),   # T0      (baseline / condition)
+            to_u8(generated[i, 0]),  # T1_gen  (generated follow-up)
+            to_u8(real[i, 0]),       # T1_real (ground-truth follow-up)
+        ])
+        lbl = int(labels[i]) if labels is not None else -1
+        np.save(os.path.join(seed_dir, f"sample_{i:04d}_{lbl}.npy"), trip)
+
+    return baseline.shape[0]
 
 
 def main():
@@ -186,52 +219,79 @@ def main():
     latent_mean, latent_std = cfg_ae["mean"], cfg_ae["std"]
     predict_delta = bool(cfg_diff.get("latent_predict_delta", True))
 
-    all_bl, all_real, all_gen = [], [], []
+    labels = np.array(ds.sample_labels)
+    per_seed_gen = {}
+    all_bl = all_real = None
 
-    with torch.inference_mode():
-        for bi, (bl, fu, aux_bl, aux_fu, clin, flag) in enumerate(tqdm(loader)):
-            bl, fu, aux_bl = bl.to(device), fu.to(device), aux_bl.to(device)
-            clin, flag = clin.to(device), flag.to(device).squeeze(1)
+    for seed in args.seeds:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-            if args.flag_override is not None:
-                flag = torch.full_like(flag, args.flag_override)
+        bl_chunks, real_chunks, gen_chunks = [], [], []
 
-            cond_z = norm_latent(encode_stack_chunked(ae, bl, aux_bl), latent_mean, latent_std, repeat_k=K)
-            base_z = extract_center_latent_from_stack(cond_z, K)
+        with torch.inference_mode():
+            for bi, (bl, fu, aux_bl, aux_fu, clin, flag) in enumerate(
+                tqdm(loader, desc=f"seed {seed}")
+            ):
+                bl, fu, aux_bl = bl.to(device), fu.to(device), aux_bl.to(device)
+                clin, flag = clin.to(device), flag.to(device).squeeze(1)
 
-            gen_pred = diffusion.sample_conditioned(
-                cond_img=cond_z, seg=None, clinical_vars=clin,
-                expansion_flag=flag, cond_scale=args.cond_scale,
-            )
-            gen_z = gen_pred + base_z if predict_delta else gen_pred
-            gen = ae.decode(unnorm_latent(gen_z, latent_mean, latent_std, repeat_k=1))[:, 0:1].clamp(0, 1)
+                if args.flag_override is not None:
+                    flag = torch.full_like(flag, args.flag_override)
 
-            mid = K // 2
-            bl_c = bl[:, mid : mid + 1]
-            fu_c = fu[:, mid : mid + 1]
+                cond_z = norm_latent(encode_stack_chunked(ae, bl, aux_bl), latent_mean, latent_std, repeat_k=K)
+                base_z = extract_center_latent_from_stack(cond_z, K)
 
-            all_bl.append(bl_c.cpu().numpy())
-            all_real.append(fu_c.cpu().numpy())
-            all_gen.append(gen.cpu().numpy())
+                gen_pred = diffusion.sample_conditioned(
+                    cond_img=cond_z, seg=None, clinical_vars=clin,
+                    expansion_flag=flag, cond_scale=args.cond_scale,
+                )
+                gen_z = gen_pred + base_z if predict_delta else gen_pred
+                gen = ae.decode(unnorm_latent(gen_z, latent_mean, latent_std, repeat_k=1))[:, 0:1].clamp(0, 1)
 
-            save_image(
-                torch.cat([bl_c, fu_c, gen], dim=0),
-                os.path.join(out_dir, "grids", f"batch_{bi:04d}.png"),
-                nrow=bl_c.shape[0],
-            )
+                mid = K // 2
+                bl_c = bl[:, mid : mid + 1]
+                fu_c = fu[:, mid : mid + 1]
+
+                bl_chunks.append(bl_c.cpu().numpy())
+                real_chunks.append(fu_c.cpu().numpy())
+                gen_chunks.append(gen.cpu().numpy())
+
+                if seed == args.seeds[0]:
+                    save_image(
+                        torch.cat([bl_c, fu_c, gen], dim=0),
+                        os.path.join(out_dir, "grids", f"batch_{bi:04d}.png"),
+                        nrow=bl_c.shape[0],
+                    )
+
+        # The loader is shuffle=False, so batch order matches ds.samples for
+        # every seed; baseline/real are identical across seeds by construction.
+        all_bl = np.concatenate(bl_chunks, axis=0)
+        all_real = np.concatenate(real_chunks, axis=0)
+        per_seed_gen[seed] = np.concatenate(gen_chunks, axis=0)
+
+        if args.export_triplets:
+            n = export_triplets(args.export_triplets, seed, all_bl,
+                                per_seed_gen[seed], all_real, labels)
+            print(f"  seed {seed}: exported {n} triplets")
 
     out_npz = os.path.join(out_dir, "predictions.npz")
     np.savez_compressed(
         out_npz,
-        baseline=np.concatenate(all_bl, axis=0),
-        followup_real=np.concatenate(all_real, axis=0),
-        followup_generated=np.concatenate(all_gen, axis=0),
+        baseline=all_bl,
+        followup_real=all_real,
+        # [n_seeds, N, 1, H, W]; index 0 is the first seed, for single-seed use.
+        followup_generated=np.stack([per_seed_gen[s] for s in args.seeds], axis=0),
+        seeds=np.array(args.seeds),
         subject_ids=np.array([s["subject_id"] for s in ds.samples]),
-        labels=np.array(ds.sample_labels),
+        labels=labels,
         cond_scale=args.cond_scale,
         flag_override=-1 if args.flag_override is None else args.flag_override,
     )
     print(f"wrote {out_npz}")
+    if args.export_triplets:
+        print(f"triplets under {args.export_triplets} "
+              f"(nodule_quality_eval --input-format npy)")
 
 
 if __name__ == "__main__":
