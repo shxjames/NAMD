@@ -1,6 +1,14 @@
-from denoising_diffusion_pytorch import MultiHeadAEKL, Unet, GaussianDiffusion, Trainer
 import os
 import sys
+
+# MUST precede the denoising_diffusion_pytorch import below. The vendored
+# (adapted) fork has to win over any pip-installed copy, including an editable
+# install pointing at a different checkout; sys.path order is the only thing
+# that guarantees it, and it is only effective if set before the import runs.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "denoising-diffusion-pytorch"))
+sys.path.insert(0, _HERE)
+
 import json
 import time
 import random
@@ -8,13 +16,7 @@ import numpy as np
 import torch
 import argparse
 
-# Make `nlst_dataset` importable no matter where the script is launched from.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# The vendored (adapted) fork must win over any pip-installed
-# denoising-diffusion-pytorch, including an editable install pointing at a
-# different checkout. Path order is the only thing that reliably guarantees it.
-sys.path.insert(0, os.path.join(_HERE, "denoising-diffusion-pytorch"))
-sys.path.insert(0, _HERE)
+from denoising_diffusion_pytorch import MultiHeadAEKL, Unet, GaussianDiffusion, Trainer
 
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
