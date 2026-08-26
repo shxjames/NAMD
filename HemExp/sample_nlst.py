@@ -126,11 +126,29 @@ def main():
     ).to(device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    state = ckpt.get("ema") if (args.use_ema and ckpt.get("ema")) else ckpt["model"]
-    # EMA state dicts prefix the wrapped weights; strip it so both load the same way.
-    state = {k.replace("ema_model.", "", 1): v for k, v in state.items() if not k.startswith("initted")}
+
+    # An EMA state dict holds the averaged weights under `ema_model.`, the live
+    # ones under `online_model.`, plus bookkeeping scalars. Select the averaged
+    # subset rather than merely stripping the prefix -- otherwise every
+    # online_model.* key rides along as "unexpected", which both hides a real
+    # mismatch and makes the diagnostic below meaningless.
+    state, source = None, "model"
+    if args.use_ema and ckpt.get("ema"):
+        ema_state = {
+            k[len("ema_model."):]: v
+            for k, v in ckpt["ema"].items()
+            if k.startswith("ema_model.")
+        }
+        if ema_state:
+            state, source = ema_state, "ema"
+
+    if state is None:
+        state = ckpt["model"]
+
     missing, unexpected = diffusion.load_state_dict(state, strict=False)
-    print(f"loaded {args.ckpt} (ema={args.use_ema}) | missing={len(missing)} unexpected={len(unexpected)}")
+    print(f"loaded {args.ckpt} (weights={source}) | missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        raise RuntimeError(f"checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}")
     diffusion.eval()
 
     # ---------------------------------------------------------------- dataset
