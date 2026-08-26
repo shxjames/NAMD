@@ -7,7 +7,7 @@
 #SBATCH --partition=vvh-l40s
 #SBATCH --gpus=1
 #SBATCH --gpus-per-node=1
-#SBATCH --time=8:00:00
+#SBATCH --time=16:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem-per-gpu=60GB
@@ -33,7 +33,11 @@ cd /scratch/liyues_root/liyues/shxjames/NAMD/.claude/worktrees/hemexp-nlst/HemEx
 
 RUNS=/scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs
 D=$RUNS/diffusion/20260825_213513__config_nlst
-SEEDS="0 1 2 3 4"
+# The canonical 20-seed set every other arm in this repo was evaluated with
+# (recovered from results_ctclip_e69/per_sample_summary). Matching both the
+# COUNT and the VALUES is what makes the numbers comparable -- 5 arbitrary
+# seeds produce a noisier average that cannot sit beside 20-seed results.
+SEEDS="23 28 42 55 92 115 147 330 401 403 450 599 642 679 713 756 888 893 912 974"
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
