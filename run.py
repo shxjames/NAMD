@@ -6,6 +6,17 @@ from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers import WandbLogger
 
 import torch
+
+# torch>=2.6 defaults torch.load to weights_only=True, which breaks
+# pytorch_lightning 1.5's internal checkpoint restore (Lightning ckpts carry
+# numpy scalars etc.). All checkpoints here are locally produced, so restore
+# the old default process-wide.
+_torch_load_orig = torch.load
+def _torch_load_full(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _torch_load_orig(*args, **kwargs)
+torch.load = _torch_load_full
+
 import matplotlib.pyplot as plt
 import os
 import wandb
@@ -113,9 +124,25 @@ def get_parser(**parser_kwargs):
     )
 
     parser.add_argument(
-        "--config", 
+        "--config",
         type=str,
         required=True,
+    )
+
+    parser.add_argument(
+        "--set",
+        type=str,
+        nargs="*",
+        default=[],
+        help="OmegaConf dotlist overrides applied on top of --config, e.g. "
+             "--set model.params.feature_loss_weight=1.0 data.params.batch_size=64",
+    )
+
+    parser.add_argument(
+        "--save_top_k",
+        type=int,
+        default=10,
+        help="how many checkpoints ModelCheckpoint keeps (use 1 for HP screens)",
     )
 
     parser.add_argument(
@@ -343,6 +370,11 @@ def main():
     args = parser.parse_args()
 
     config = OmegaConf.load(args.config)
+    if args.set:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(args.set))
+        print("Applied config overrides:")
+        for kv in args.set:
+            print(f"  {kv}")
 
     model = instantiate_from_config(config.model)
 
@@ -485,7 +517,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=f'checkpoints/{args.project}',
         filename=f'{{epoch:02d}}-{{{args.monitor_loss}:.3f}}',
-        save_top_k=10,
+        save_top_k=args.save_top_k,
         monitor=args.monitor_loss,
         mode='max' if 'auroc' in args.monitor_loss else 'min',
         every_n_epochs=1,
@@ -560,9 +592,7 @@ def main():
         # - Epoch/step counters
         # - RNG states
 
-        if resume_from_checkpoint:
-            model.init_from_ckpt(resume_from_checkpoint)
-        trainer.fit(model, dm)
+        trainer.fit(model, dm, ckpt_path=resume_from_checkpoint)
 
     if args.ckpt == "":
         args.ckpt = get_best_checkpoint(args.project)

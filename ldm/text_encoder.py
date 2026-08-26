@@ -58,7 +58,6 @@ class TextContextEncoder(nn.Module):
     
     ### emb_txt = self.text_encoder(tok_txt.to(x_in.device), self.contexts) 
     def forward(self, text, context=None, train=False, alpha=None):
-
         ### text [batch, 128] - token IDs
         ### x_text [batch, 128, 2560] - token embeddings
         x_text = self.token_embedding(text)  # batch, n_text, C

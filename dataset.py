@@ -598,7 +598,11 @@ class Lung_Pair_DS(Dataset):
         if not hasattr(self, 'labels'):
             self.labels = np.zeros(len(self.features)) # dummy for conditional training
         
-        # Determine number of workers
+        # NB: do not "fix" this to respect the cgroup CPU allocation without also
+        # bounding `chunksize` below -- chunksize is len(args_list)//num_workers, so
+        # cutting the worker count inflates each chunk's buffered results and RAISES
+        # peak memory. Dropping to 3 workers OOM-killed the pool, which then hung at
+        # 0/N forever because imap waits on a dead worker.
         num_workers = max(1, cpu_count() - 1)  # Leave one CPU free
         # Prepare arguments for parallel processing
         args_list = [
@@ -847,6 +851,7 @@ class Lung_DM(pl.LightningDataModule):
         self,
         dataset_class: Dataset,  # Pass the actual class object, e.g., Lung_Pair_DS
         batch_size: int = 32,
+        val_batch_size: Optional[int] = None,
         num_workers: int = 4,
         pin_memory: bool = True,
         shuffle: bool = True,
@@ -855,6 +860,12 @@ class Lung_DM(pl.LightningDataModule):
         benign_ratio: float = 0.5,
         **input_kwargs
     ):
+        # val/test batch size is decoupled from the training batch size so that
+        # batch-coupled validation losses (KLDistanceLoss builds a softmax over the
+        # other B-1 samples in the batch) stay comparable across runs that train at
+        # different batch sizes. Defaults to batch_size when unset.
+        if val_batch_size is None:
+            val_batch_size = batch_size
         super().__init__()
         self.save_hyperparameters(ignore=['dataset_class'] + list(input_kwargs.keys()))
         self.dataset_cls = dataset_class
@@ -898,7 +909,7 @@ class Lung_DM(pl.LightningDataModule):
                 )
                 self.val_sampler = FeatureGroupedBatchSampler(
                     features=self.val_dataset.features,
-                    batch_size=self.hparams.batch_size,
+                    batch_size=self.hparams.val_batch_size,
                     shuffle=False,
                     drop_last=False,
                 )
@@ -912,7 +923,7 @@ class Lung_DM(pl.LightningDataModule):
                 )
                 self.val_sampler = BalancedBatchSampler(
                     labels=self.val_dataset.labels,
-                    batch_size=self.hparams.batch_size,
+                    batch_size=self.hparams.val_batch_size,
                     benign_ratio=self.benign_ratio,
                     shuffle=False,
                     drop_last=False,
@@ -946,7 +957,7 @@ class Lung_DM(pl.LightningDataModule):
         else:
             return DataLoader(
                 self.val_dataset,
-                batch_size=self.hparams.batch_size,
+                batch_size=self.hparams.val_batch_size,
                 num_workers=self.hparams.num_workers,
                 pin_memory=self.hparams.pin_memory,
                 shuffle=False,
@@ -955,7 +966,7 @@ class Lung_DM(pl.LightningDataModule):
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=self.hparams.val_batch_size,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
