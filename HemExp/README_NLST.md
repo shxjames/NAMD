@@ -89,6 +89,38 @@ re-pins the whole torch/CUDA stack. Note the entrypoints prepend the sibling
 pip-installed copy; don't rely on `pip install -e` pointing at the right
 checkout.
 
+### Results (20 seeds, 64x64 re-framed, 2026-08-26)
+
+`python compare_arms.py` — paper metrics, higher is better:
+
+| arm | traj_cos | n_cos | r_area | r_HU |
+| --- | --- | --- | --- | --- |
+| **hemexp_final_c64** | **0.3745** | 8573 | 0.689 | 0.729 |
+| ctclip_e69 | 0.3644 | 8564 | 0.680 | 0.732 |
+| ctclip_e38 | 0.3435 | 8529 | 0.647 | 0.693 |
+| alignvae_last | 0.3406 | 8539 | 0.613 | 0.645 |
+| pred_clip_e36 | 0.3246 | 8512 | 0.588 | 0.630 |
+| hemexp_best_c64 | 0.2923 | 8569 | 0.584 | 0.622 |
+| ifn_0624 | 0.2432 | 8473 | 0.711 | 0.468 |
+
+`n_cos` (samples surviving radiomic extraction) now matches the other arms,
+which is what makes the row comparable at all — see the field-of-view section.
+
+Two conclusions:
+
+1. **Use the final checkpoint, not the val-loss minimum.** `hemexp_final_c64`
+   0.3745 vs `hemexp_best_c64` 0.2923, a 28% relative gap, even though the
+   final checkpoint's val loss is 35% HIGHER (0.172 vs 0.127). Selecting on
+   val/loss would have cost most of the arm's performance.
+2. **The arm is competitive on trajectory cosine** — nominally first, ahead of
+   ctclip_e69 — with r_HU essentially tied and r_area slightly ahead.
+
+**Caveat that qualifies conclusion 2.** The model conditions on and generates
+the full 128x128 field; only evaluation is cropped to 64x64. The NAMD arms
+condition on 64x64 only, so HemExp had roughly 4x the conditioning context.
+That asymmetry favours HemExp and is not separable from method quality without
+retraining on 64x64 crops. Treat the ranking as promising, not settled.
+
 ### FIELD OF VIEW: read this before comparing arms
 
 Every arm already in `nodule_quality_eval` was built and evaluated on **64x64**
