@@ -171,7 +171,35 @@ checkpoints are written every 5.
 Note the balanced sampler oversamples the 175 positives roughly 4×, so a
 diffusion epoch is `2 × 725 = 1450` samples rather than 900.
 
-## Observed run behaviour (2026-08-25, 150 epochs each)
+## Completed run (2026-08-25)
+
+All under `$RUNS = NAMD/HemExp_NLST_runs/`.
+
+| stage | job | elapsed | output |
+| --- | --- | --- | --- |
+| autoencoder | 27524301 | 27 min | `autoencoder/checkpoints/checkpoint_{best,last}.pth` |
+| diffusion | 27524366 | 37 min | `diffusion/20260825_213513__config_nlst/model-{best,1..30}.pt` |
+| sampling | 27524455 | 21 min | `eval_triplets_{best,final}/`, `samples_{best,final}/` |
+
+Test-split generation: 450 subjects x 5 seeds = 2250 triplets per checkpoint,
+verified readable by `nodule_quality_eval.load_triplets.iter_npy_triplets`
+(labels parse to 1191 benign / 159 malignant per 3 seeds, matching the split).
+
+Next step — not yet run, needs MedSAM 2 + pyradiomics:
+
+```bash
+python nodule_quality_eval/run_evaluation.py \
+    --input-dir $RUNS/eval_triplets_best --input-format npy \
+    --cache-dir cache_hemexp_best --out-tag hemexp_best
+# and again with eval_triplets_final / hemexp_final
+```
+
+**Disk**: the run directory is ~52 GB, of which 48 GB is 31 diffusion
+checkpoints at 1.3 GB each (model + optimizer + EMA). Only `model-best.pt` and
+`model-30.pt` are needed once the arm is evaluated; the intermediates are
+prunable. `save_every` is 5 epochs, which is finer than this arm needs.
+
+## Observed run behaviour (150 epochs each)
 
 **Stage 1 (autoencoder)** converged cleanly: val recon 5.5e-3 at epoch 1 to
 3.1e-4 by epoch 114, flat thereafter. Perceptual loss at epoch 58 caused no
