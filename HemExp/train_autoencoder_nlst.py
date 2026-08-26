@@ -469,6 +469,28 @@ def main():
                 break
 
     pbar.close()
+
+    # HemExp ships its FINAL checkpoint (adversarially finetuned), while NAMD's
+    # convention for the VAE stage is lowest-val. Save both so the choice is a
+    # config edit rather than a re-run: the last ~25% of training here is the
+    # adversarial phase, which raises val recon by design.
+    if accelerator.is_main_process:
+        ckpt_dir = os.path.join(output_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(
+            {
+                "global_step": global_step,
+                "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                "discriminator_state_dict": accelerator.unwrap_model(discriminator).state_dict(),
+                "image_size": int(cfg["image_size"]),
+                "latent_channels": int(cfg["latent_channels"]),
+                "head_names": ["ct"],
+                "in_channels": 1,
+            },
+            os.path.join(ckpt_dir, "checkpoint_last.pth"),
+        )
+        print(f"Saved checkpoint_last.pth at step {global_step} (best val loss {best_val:.6f})")
+
     print(f"Done in {time.time() - start_time:.1f}s")
     if cfg["wandb_enabled"] and accelerator.is_main_process:
         wandb.finish()
