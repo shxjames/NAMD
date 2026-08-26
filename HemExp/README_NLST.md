@@ -171,6 +171,26 @@ checkpoints are written every 5.
 Note the balanced sampler oversamples the 175 positives roughly 4×, so a
 diffusion epoch is `2 × 725 = 1450` samples rather than 900.
 
+## Observed run behaviour (2026-08-25, 150 epochs each)
+
+**Stage 1 (autoencoder)** converged cleanly: val recon 5.5e-3 at epoch 1 to
+3.1e-4 by epoch 114, flat thereafter. Perceptual loss at epoch 58 caused no
+visible disruption. Adversarial at epoch 115 raised val recon to a stable
+~4.1e-4 — the intended fidelity-for-sharpness trade, not a regression.
+`checkpoint_best.pth` holds epoch 114; `checkpoint_last.pth` the finetuned model.
+
+**Stage 2 (diffusion)** val loss bottomed at **0.1275 around epoch 36** and rose
+steadily afterwards (0.1349 by epoch 63). The evaluation is deterministic, so
+that is a real trend, not sampling noise — 900 training pairs, one per patient,
+is a small corpus and the model starts fitting it.
+
+Do NOT conclude from this alone that ~36 epochs is the right budget. On this
+project `val/loss` has repeatedly been a poor checkpoint selector for the *UNet*
+stages, with late checkpoints outperforming the val-loss minimum; the VAE stage
+is the opposite, which is why stage 1 uses lowest-val and it works. Evaluate the
+arm at **both** `model-best.pt` (the val minimum) and the final checkpoint, and
+let the generation metrics decide rather than the loss curve.
+
 ## Notes before a real run
 - **Oracle flag.** Training conditions on the ground-truth malignancy label. That
   is intended for counterfactual simulation, but it makes any downstream
