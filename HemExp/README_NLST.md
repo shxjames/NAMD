@@ -89,6 +89,36 @@ re-pins the whole torch/CUDA stack. Note the entrypoints prepend the sibling
 pip-installed copy; don't rely on `pip install -e` pointing at the right
 checkout.
 
+### FIELD OF VIEW: read this before comparing arms
+
+Every arm already in `nodule_quality_eval` was built and evaluated on **64x64**
+images. This arm generates **128x128**. They are not the same task, and the
+difference is a field of view, not a resolution:
+
+    their_image == our_patch[32:96, 32:96]      # exact, 0 difference
+
+`NLST_with_second_large_cleaned` is a LARGER field-of-view version of the data
+those arms were trained on. In their framing the nodule fills the frame; in the
+full 128x128 patch it occupies about a quarter of it. Consequences:
+
+- Areas, diameters and every other pixel-unit metric are on different scales.
+- MedSAM 2 segments the wider frame far less reliably. On identical real T0
+  images it failed on 1060 of ours versus 280 of theirs, so the metrics are
+  also averaged over different surviving subsets.
+
+Putting a raw 128x128 result next to their table is meaningless. Use
+`crop_triplets.py` to re-frame exported triplets to the common 64x64 window
+first:
+
+```bash
+python crop_triplets.py --in-dir $RUNS/eval_triplets_final \
+                        --out-dir $RUNS/eval_triplets_final_c64
+```
+
+That still is not a like-for-like reproduction: the model GENERATED the full
+128x128 field and only evaluation is re-framed. Training on 64x64 crops would
+be the strict version.
+
 ### Comparing against the other NAMD arms
 
 `sample_nlst.py --export-triplets` writes the layout `nodule_quality_eval`
