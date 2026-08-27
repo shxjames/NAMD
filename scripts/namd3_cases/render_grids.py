@@ -37,15 +37,22 @@ def row_label(row, with_probs):
     tag = "malignant" if row.label == 1 else "benign"
     txt = f"#{int(row['sample'])}  {tag}\nLPIPS {row.lpips_mean:.3f}"
     if with_probs:
+        # The Cond / GT probabilities are printed under their own tiles, so the
+        # caption only carries the across-seed aggregate.
         txt += (f"\nViT ok {int(row.seeds_correct)}/20"
-                f"\n$p_{{mal}}$ GT  {row.prob_real:.2f}"
                 f"\n$p_{{mal}}$ gen {row.p_gen_mean:.2f}$\\pm${row.p_gen_std:.2f}")
     return txt
 
 
 def draw_grid(df, t0, real, gen, seed_ids, lpips, probs, id_to_pos,
-              out_path, title, show_error=False, show_probs=False):
-    """probs: [S, N] ViT malignancy probability for the generated images."""
+              out_path, title, show_error=False, show_probs=False,
+              p_cond=None, p_gt=None):
+    """probs: [S, N] ViT malignancy probability for the generated images.
+
+    p_cond / p_gt: [N] the same probability for the conditioning image and the
+    real follow-up, annotated under their columns so every tile in the figure
+    carries a directly comparable number.
+    """
     n_rows = len(df)
     n_cols = 2 + len(seed_ids) + (1 if show_error else 0)
 
@@ -78,13 +85,19 @@ def draw_grid(df, t0, real, gen, seed_ids, lpips, probs, id_to_pos,
                 sp.set_visible(False)
             if r == 0:
                 ax.set_title(head, fontsize=7.5, pad=3)
-            if show_probs and c >= 2:
-                p = probs[c - 2, j]
-                ok = (p >= 0.5) == (row.label == 1)
-                ax.text(0.5, -0.06, f"{p:.2f}", transform=ax.transAxes,
-                        ha="center", va="top", fontsize=6.2,
-                        color=CORRECT_C if ok else WRONG_C,
-                        fontweight="bold" if not ok else "normal")
+            if show_probs:
+                if c == 0:
+                    p = None if p_cond is None else p_cond[j]
+                elif c == 1:
+                    p = None if p_gt is None else p_gt[j]
+                else:
+                    p = probs[c - 2, j]
+                if p is not None:
+                    ok = (p >= 0.5) == (row.label == 1)
+                    ax.text(0.5, -0.06, f"{p:.2f}", transform=ax.transAxes,
+                            ha="center", va="top", fontsize=6.2,
+                            color=CORRECT_C if ok else WRONG_C,
+                            fontweight="bold" if not ok else "normal")
 
         if show_error:
             ax = fig.add_subplot(gs[r, n_cols - 1])
@@ -119,6 +132,9 @@ def main():
     npz = np.load(os.path.join(args.dir, "per_sample_seed_metrics.npz"))
     thr = youden_threshold(npz["labels"], npz["logit_real"][0])
     probs = sigmoid(npz["logit_gen"] - thr)          # [S, N] p(malignant)
+    # T0 and T1_real are identical across seeds, so row 0 is the whole story.
+    p_cond = sigmoid(npz["logit_t0"][0] - thr)       # [N]
+    p_gt = sigmoid(npz["logit_real"][0] - thr)       # [N]
 
     full = pd.read_csv(os.path.join(args.dir, "per_sample_metrics.csv"))
     succ = pd.read_csv(os.path.join(args.dir, "success_cases.csv"))
@@ -140,8 +156,8 @@ def main():
     draw_grid(fail, t0, real, gen, seed_ids, npz["lpips"], probs, id_to_pos,
               os.path.join(args.dir, "failure_grid.png"),
               "NAMD_3 — failure cases, all 20 seeds "
-              "(number under each seed = ViT $p$(malignant); red = wrong call)",
-              show_error=True, show_probs=True)
+              "(number under every tile = ViT $p$(malignant); red = wrong call)",
+              show_error=True, show_probs=True, p_cond=p_cond, p_gt=p_gt)
 
 
 if __name__ == "__main__":

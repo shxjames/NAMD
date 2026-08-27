@@ -92,6 +92,7 @@ def build_table(npz, thr):
         "logit_gen_std": lg.std(0),
         "prob_gen_mean": p_gen.mean(0),
         "seeds_correct": correct.sum(0).astype(int),
+        "seeds_pred_mal": pred_gen.sum(0).astype(int),
         "true_class_conf": signed_conf.mean(0),
         "logit_real": lr[0],
         "prob_real": sigmoid(lr[0] - thr),
@@ -430,6 +431,28 @@ def cohort_stats(df):
                f"{(df.seeds_correct >= 19).mean():.2f} overall. So the two failure "
                f"buckets in section 2 are genuinely different failure modes, not "
                f"one phenomenon seen twice.")
+
+    # Does the model reproduce a diagnostic *change* between the two visits?
+    n_seeds = 20
+    c_cond = (df.prob_t0 >= 0.5).astype(int)
+    c_gt = (df.prob_real >= 0.5).astype(int)
+    side_cond = np.where(c_cond == 1, df.seeds_pred_mal,
+                         n_seeds - df.seeds_pred_mal) / n_seeds
+    match_gt = np.where(c_gt == 1, df.seeds_pred_mal,
+                        n_seeds - df.seeds_pred_mal) / n_seeds
+    dis = (c_cond != c_gt)
+    out.append(f"When the ViT reads T0 and the real follow-up the **same** way "
+               f"(n={int((~dis).sum())}), the generated image matches "
+               f"{match_gt[~dis].mean():.2f} of the time. When it reads them "
+               f"**differently** (n={int(dis.sum())}) the generations are at "
+               f"chance: {side_cond[dis].mean():.2f} side with T0, "
+               f"{1 - side_cond[dis].mean():.2f} with the real follow-up. The "
+               f"model reproduces appearance well but carries little signal "
+               f"about the direction of change — which is where the classifier "
+               f"flips come from. Note it is *not* simply copying T0: "
+               f"corr(p_gen, p_GT) = {pearsonr(df.prob_gen_mean, df.prob_real)[0]:.2f} "
+               f"slightly exceeds corr(p_gen, p_cond) = "
+               f"{pearsonr(df.prob_gen_mean, df.prob_t0)[0]:.2f}.")
 
     ok = df[df.real_correct == 1]
     flip, stable = ok[ok.seeds_correct <= 1], ok[ok.seeds_correct >= 19]
