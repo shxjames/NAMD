@@ -36,13 +36,16 @@ while true; do
   fi
 
   # --- epoch progress on a stride, so a 70-epoch run does not fire 70 events ---
-  if [ -f "$ERR" ]; then
-    e=$(grep -oE "Epoch [0-9]+" "$ERR" 2>/dev/null | tail -1 | grep -oE "[0-9]+")
+  # Read the run's own one-line-per-epoch summary in .out rather than scraping
+  # the progress bar in .err: the bar's trailing "val/loss=0.322." picked up a
+  # stray '.' and carried no train loss. This line has both, already formatted.
+  if [ -f "$OUT" ]; then
+    summary=$(tr '\r' '\n' < "$OUT" 2>/dev/null | grep -E "^\[Epoch +[0-9]+\]" | tail -1)
+    e=$(echo "$summary" | grep -oE "^\[Epoch +[0-9]+\]" | grep -oE "[0-9]+")
     if [ -n "$e" ] && [ "$e" -ne "$last_epoch" ] 2>/dev/null; then
       if [ $((e % STRIDE)) -eq 0 ] && [ -z "${seen[ep$e]}" ]; then
         seen[ep$e]=1
-        loss=$(grep -oE "val/loss[^ ,]*[= ][0-9.]+" "$ERR" 2>/dev/null | tail -1)
-        emit EPOCH "epoch $e/70 ${loss:+($loss)}"
+        emit EPOCH "$(echo "$summary" | tr -s ' ')  [$e/70]"
       fi
       last_epoch=$e
     fi
@@ -66,9 +69,28 @@ while true; do
     sleep 10
     final=$(sacct -j "$JOBID" -n -o State%20 2>/dev/null | head -1 | tr -d ' ')
     emit DONE "job $JOBID left the queue; final state: ${final:-UNKNOWN}"
+    # Summarise, never raw-tail. A plain `tail` here dumps Lightning progress-bar
+    # lines that each carry a few hundred per-tensor grad-norm fields, which the
+    # notification then truncates mid-token -- pages of noise, no signal. The
+    # run's own one-line-per-epoch summary is the thing worth reporting.
+    # The per-epoch summary is written to stdout (.out); .err carries only the
+    # Lightning progress bar. Verified against the epoch-4 log on 2026-08-27.
     if [ -f "$OUT" ]; then
-      tail -5 "$OUT" 2>/dev/null | sed 's/^/[abl-none TAIL] /'
+      tr '\r' '\n' < "$OUT" 2>/dev/null \
+        | grep -E "^\[Epoch +[0-9]+\]" | tail -3 \
+        | sed 's/^/[abl-none LAST] /'
     fi
+    # On a non-clean exit, surface the real error instead of the epoch summary.
+    case "${final:-}" in
+      COMPLETED|CANCELLED*) ;;
+      *)
+        for f in "$ERR" "$OUT"; do
+          [ -f "$f" ] || continue
+          grep -E "Traceback|Error|CUDA out of memory|Killed" "$f" 2>/dev/null \
+            | tail -3 | cut -c1-240 | sed "s|^|[abl-none FAIL $(basename "$f")] |"
+        done
+        ;;
+    esac
     exit 0
   fi
 
