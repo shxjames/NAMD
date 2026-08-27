@@ -4,7 +4,7 @@
 #SBATCH --output=namd3-cases.out
 #SBATCH --error=namd3-cases.err
 #SBATCH --account=liyues
-#SBATCH --partition=liyues-a100
+#SBATCH --partition=vvh-l40s
 #SBATCH --gpus=1
 #SBATCH --gpus-per-node=1
 #SBATCH --time=12:00:00
