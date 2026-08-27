@@ -89,7 +89,13 @@ re-pins the whole torch/CUDA stack. Note the entrypoints prepend the sibling
 pip-installed copy; don't rely on `pip install -e` pointing at the right
 checkout.
 
-### Results (20 seeds, 64x64 re-framed, 2026-08-26)
+### SUPERSEDED — Results (20 seeds, 128px model, evaluation cropped, 2026-08-26)
+
+> **These numbers are not a valid comparison.** The model was trained at
+> 128x128 and only its OUTPUT was cropped to 64x64, so it still conditioned on
+> ~4x the context the NAMD arms get. Retraining at 64x64 reverses the ranking:
+> traj_cos 0.3407 vs ctclip's 0.3645, losing 0/20 seeds. See the RESULTS
+> section at the top. Kept only to document the progression.
 
 `python compare_arms.py` — paper metrics, higher is better:
 
@@ -112,8 +118,9 @@ Two conclusions:
    0.3745 vs `hemexp_best_c64` 0.2923, a 28% relative gap, even though the
    final checkpoint's val loss is 35% HIGHER (0.172 vs 0.127). Selecting on
    val/loss would have cost most of the arm's performance.
-2. **The arm is competitive on trajectory cosine** — nominally first, ahead of
-   ctclip_e69 — with r_HU essentially tied and r_area slightly ahead.
+2. ~~The arm is competitive on trajectory cosine~~ **WRONG** — this was the
+   field-of-view advantage. At 64x64 parity HemExp scores 0.3407 and loses to
+   ctclip_e69 on every one of 20 seeds (p = 1.2e-07).
 
 **Caveat that qualifies conclusion 2.** The model conditions on and generates
 the full 128x128 field; only evaluation is cropped to 64x64. The NAMD arms
@@ -232,6 +239,59 @@ checkpoints are written every 5.
 
 Note the balanced sampler oversamples the 175 positives roughly 4×, so a
 diffusion epoch is `2 × 725 = 1450` samples rather than 900.
+
+## RESULTS — read this section first (2026-08-27)
+
+**The valid comparison is the PARITY column.** Every earlier HemExp number was
+measured with an advantage the NAMD arms did not have, and all of them
+disappear once matched. Metrics: higher is better except LPIPS / FID / sphere MAE.
+
+| metric | FLAGGED (invalid) | NO-FLAG 128px | **PARITY final** | NAMD_3 / ctclip |
+| --- | --- | --- | --- | --- |
+| ROC-AUC gt *(ceiling)* | 0.8136 | 0.8136 | 0.8136 | 0.8190 |
+| ROC-AUC avg_score | **0.9009** ⚠ above ceiling | 0.7511 | 0.7634 ± 0.021 | **0.8052** |
+| AUPRC avg_score | **0.5403** ⚠ above ceiling | 0.3132 | 0.3044 ± 0.030 | **0.3469** |
+| LPIPS ↓ | 0.1901 | 0.1868 | **0.1692** | 0.2229 |
+| FID ↓ | 67.24 | 67.36 | 88.92 | **82.97** |
+| HaarPSI ↑ | 0.3281 | 0.3297 | **0.3276** | 0.3248 |
+| traj_cos ↑ | 0.3745 | 0.3681 | 0.3407 | **0.3644** |
+| r_area ↑ | 0.689 | 0.686 | 0.643 | **0.680** |
+| r_HU ↑ | 0.729 | 0.714 | 0.708 | **0.732** |
+| sphere MAE ↓ | 0.1072 | 0.1076 | 0.1043 | 0.1040 |
+
+### Conclusion: at parity HemExp does NOT beat the existing arms
+
+Paired over the same 20 seeds and 450 subjects (ctclip_e69):
+
+| metric | HemExp parity | ctclip | diff | p | seeds won |
+| --- | --- | --- | --- | --- | --- |
+| traj_cos | 0.3408 ± 0.008 | 0.3645 ± 0.011 | −0.0236 | 1.2e-07 | **0/20** |
+| r_area | 0.6434 ± 0.031 | 0.6800 ± 0.017 | −0.0365 | 5.3e-04 | 2/20 |
+| r_HU | 0.7083 ± 0.021 | 0.7326 ± 0.013 | −0.0243 | 1.8e-04 | 3/20 |
+| sphere MAE | 0.1043 ± 0.004 | 0.1040 ± 0.004 | +0.0004 | 0.73 | 9/20 |
+
+HemExp loses the paper's headline metric on **every** seed. It wins LPIPS
+(0.169 vs 0.223) and ties HaarPSI — locally sharper patches — but tracks real
+nodule progression less faithfully, and is worse on classification and FID.
+
+An earlier version of this file reported HemExp leading traj_cos at 0.3745.
+That was the field-of-view advantage, not the method.
+
+### The three defects, and what each was worth
+
+1. **Oracle label leak.** HemExp's expansion flag maps to the malignancy label.
+   Diagnostic: model AUROC 0.9009 ABOVE the 0.8136 real-image ceiling — a
+   generator cannot beat the data it imitates, so that is leakage, not skill.
+   Worth ~0.15 AUROC. Fixed by `use_expansion_flag_input: false`.
+2. **Field of view.** Trained at 128x128 vs the arms' 64x64 (~4x context).
+   Worth ~0.027 traj_cos — enough to invert the ranking.
+3. **Label-balanced batches.** 50/50 vs the natural ~19%.
+
+### Checkpoint selection: use `final`, never `model-best.pt`
+
+Confirmed in all three configurations. At parity: traj_cos 0.3407 (final) vs
+0.2957 (best), FID 88.9 vs 127.3, LPIPS 0.169 vs 0.197 — despite `best` having
+the lower val loss. Do not early-stop the diffusion stage on `val/loss`.
 
 ## Completed run (2026-08-25)
 
