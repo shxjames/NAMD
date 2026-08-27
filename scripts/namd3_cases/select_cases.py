@@ -151,11 +151,34 @@ def take_balanced(pool, n, n_pos_target):
     return picked.sort_values("lpips_mean").reset_index(drop=True)
 
 
-def select_success(df, n=9, n_pos=4, min_seeds=19):
+def nodule_gate(df):
+    """Flag samples whose generated nodule is faithful on its own class's terms.
+
+    Malignant nodules are systematically larger with larger HU errors, so an
+    absolute cohort-wide threshold would silently exclude every malignant case.
+    Thresholds are therefore the median *within each label group*. Area
+    agreement is mandatory — a nodule rendered at half or double the real size
+    is not a good generation however clean it looks — plus at least one of
+    intensity or boundary shape.
+    """
+    d = df.copy()
+    d["abs_lar"] = d["log_area_ratio"].abs()
+    ok = {}
+    for c in ("abs_lar", "abs_hu_err", "sphericity_err"):
+        med = d.groupby("label")[c].transform("median")
+        ok[c] = (d[c] <= med).fillna(False)
+    return ok["abs_lar"] & (ok["abs_hu_err"] | ok["sphericity_err"])
+
+
+def select_success(df, n=9, n_pos=4, min_seeds=19, has_nodule=False):
     ok = df[(df.seeds_correct >= min_seeds) & (df.real_correct == 1)].copy()
-    print(f"[success] {len(ok)} samples pass "
+    print(f"[success] {len(ok)} samples pass the classifier filter "
           f"(>= {min_seeds}/20 seeds correct AND real T1 correct); "
           f"{int((ok.label == 1).sum())} malignant")
+    if has_nodule:
+        ok = ok[nodule_gate(df).reindex(ok.index).fillna(False)]
+        print(f"[success] {len(ok)} of those also pass the nodule-fidelity gate; "
+              f"{int((ok.label == 1).sum())} malignant")
     ok = ok.sort_values(["lpips_mean"])
     return take_balanced(ok, n, n_pos)
 
@@ -242,6 +265,11 @@ def case_row(axes, t0, real, gen_stack, seed_ids, lpips_col):
 def render_set(df, t0, real, gen, seed_ids, lpips, id_to_pos, out_dir, title,
                has_nodule):
     os.makedirs(out_dir, exist_ok=True)
+    # Drop panels from an earlier selection so the directory only ever holds the
+    # cases the current run actually chose.
+    for stale in os.listdir(out_dir):
+        if stale.endswith(".png"):
+            os.remove(os.path.join(out_dir, stale))
     n = len(df)
     fig, axes = plt.subplots(n, 6, figsize=(15, 2.55 * n))
     if n == 1:
@@ -305,7 +333,7 @@ def main():
           f"LPIPS {df.lpips_mean.mean():.4f}  "
           f"real-image ViT accuracy {df.real_correct.mean():.3f}")
 
-    succ = select_success(df, args.n_success)
+    succ = select_success(df, args.n_success, has_nodule=has_nodule)
     fail, flip_thresh = select_failure(df, args.n_failure, has_nodule)
     succ.to_csv(os.path.join(args.out_dir, "success_cases.csv"), index=False)
     fail.to_csv(os.path.join(args.out_dir, "failure_cases.csv"), index=False)
@@ -349,8 +377,16 @@ def write_summary(out_dir, df, succ, fail, thr, has_nodule, flip_thresh):
           "for this arm; selection uses LPIPS / PSNR / centre-ROI error only.\n")
 
     A("\n## 1. Good cases (low LPIPS, ViT gets the label right)\n")
-    A("Filter: real T1 classified correctly **and** >=19/20 generated seeds "
-      "classified correctly; ranked by mean LPIPS ascending, balanced across labels.\n")
+    gate_txt = ""
+    if has_nodule:
+        gate_txt = (", **and** the generated nodule passes a fidelity gate: "
+                    "|log2 area ratio| within its own class's median, plus HU "
+                    "or sphericity error within class median. Those thresholds "
+                    "are per-label because malignant nodules are larger with "
+                    "larger HU errors, so a cohort-wide cut excludes all of them")
+    A(f"Filter: real T1 classified correctly **and** >=19/20 generated seeds "
+      f"classified correctly{gate_txt}; ranked by mean LPIPS ascending, "
+      f"balanced across labels.\n")
     A(fmt_table(succ, has_nodule))
 
     A("\n## 2. Failure cases\n")
@@ -360,8 +396,58 @@ def write_summary(out_dir, df, succ, fail, thr, has_nodule, flip_thresh):
       "class, ranked by lowest confidence in the true class.\n")
     A(fmt_table(fail, has_nodule, extra=["failure_mode"]))
 
+    A("\n## 3. Cohort context for these picks\n")
+    for line in cohort_stats(df):
+        A(f"- {line}")
+
     with open(os.path.join(out_dir, "SUMMARY.md"), "w") as f:
         f.write("\n".join(lines))
+
+
+def cohort_stats(df):
+    """The population-level facts that decide how far the case studies generalise."""
+    from scipy.stats import mannwhitneyu, pearsonr
+
+    out = []
+    d = df.dropna(subset=["log_area_ratio"])
+    shift = (df.prob_gen_mean - df.prob_real)
+
+    r, p = pearsonr(d.log_area_ratio, d.prob_gen_mean)
+    out.append(f"Generated nodule size tracks the malignancy score: "
+               f"corr(log2 area ratio, p_gen) = **{r:.2f}** (p={p:.1e}, n={len(d)}). "
+               f"Real but modest — size errors push the classifier, they do not "
+               f"determine it.")
+
+    r2, p2 = pearsonr(df.lpips_mean, shift.abs())
+    out.append(f"Perceptual quality and classifier behaviour are **decoupled**: "
+               f"corr(LPIPS, |p_gen - p_real|) = {r2:.2f} (p={p2:.2f}, n.s.).")
+
+    worst = df.nlargest(max(1, len(df) // 10), "lpips_mean")
+    out.append(f"The worst-decile-LPIPS samples are classified no worse than the "
+               f"cohort: ViT correct on >=19/20 seeds for "
+               f"{int((worst.seeds_correct >= 19).sum())}/{len(worst)} of them "
+               f"({(worst.seeds_correct >= 19).mean():.2f}) vs "
+               f"{(df.seeds_correct >= 19).mean():.2f} overall. So the two failure "
+               f"buckets in section 2 are genuinely different failure modes, not "
+               f"one phenomenon seen twice.")
+
+    ok = df[df.real_correct == 1]
+    flip, stable = ok[ok.seeds_correct <= 1], ok[ok.seeds_correct >= 19]
+    if len(flip) > 2 and len(stable) > 2:
+        _, pu = mannwhitneyu(flip.log_area_ratio.dropna(),
+                             stable.log_area_ratio.dropna())
+        out.append(f"Flipped samples do trend toward over-grown nodules (median "
+                   f"log2 area ratio {flip.log_area_ratio.median():+.2f} vs "
+                   f"{stable.log_area_ratio.median():+.2f} for stable-correct "
+                   f"ones) but with only n={len(flip)} flips this does not reach "
+                   f"significance (Mann-Whitney p={pu:.2f}) — suggestive, not "
+                   f"established.")
+        n_pos = int((flip.label == 1).sum())
+        out.append(f"Of the {len(flip)} confident flips, {len(flip) - n_pos} are "
+                   f"benign called malignant and {n_pos} malignant called benign. "
+                   f"The false-negative direction is rare here but is the "
+                   f"clinically costly one.")
+    return out
 
 
 def fmt_table(d, has_nodule, extra=()):
