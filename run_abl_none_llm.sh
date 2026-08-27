@@ -4,7 +4,13 @@
 #SBATCH --output=NAMD-abl-none.out
 #SBATCH --error=NAMD-abl-none.err
 #SBATCH --account=liyues
-#SBATCH --partition=liyues-a100
+# Both partitions, so the job takes whichever frees first. It fits on either:
+# the FULL arm reports 904M trainable + 2.5B frozen (MedGemma 4-bit), 13.5GB of
+# params; with fp32 grads + Adam states that is ~24GB, ~30GB with activations and
+# CUDA context -- clear of the L40S's 48GB as well as the A100's 80GB.
+# liyues-a100 (lh1300) is often CPU-starved rather than GPU-starved; check
+# CPUAlloc there before assuming a free GPU means a free slot.
+#SBATCH --partition=vvh-l40s,liyues-a100
 #SBATCH --gpus=1
 #SBATCH --gpus-per-node=1
 #SBATCH --time=2-00:00:00
