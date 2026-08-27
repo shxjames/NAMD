@@ -10,6 +10,7 @@ Writes results/NAMD_3_cases/per_sample_seed_metrics.npz with arrays shaped
 import argparse
 import os
 import re
+import sys
 
 import numpy as np
 import torch
@@ -17,7 +18,12 @@ from omegaconf import OmegaConf
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from tqdm import tqdm
 
-from ldm.util import instantiate_from_config
+# Running this as a script puts scripts/namd3_cases/ on sys.path, not the repo
+# root, so `ldm` has to be put there explicitly.
+sys.path.insert(0, os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)))
+
+from ldm.util import instantiate_from_config  # noqa: E402
 
 DEFAULT_NAMD_DIR = "/scratch/liyues_root/liyues/shxjames/NLST-Img/NAMD_3"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
