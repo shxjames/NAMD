@@ -1,0 +1,103 @@
+{
+  "run": {
+    "name": "config_nlst_noflag",
+    "results_root": "/scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs/diffusion_noflag",
+    "seed": 123,
+    "wandb": {
+      "enabled": true,
+      "project": "HEMEXP-NLST",
+      "entity": null
+    }
+  },
+  "data": {
+    "kind": "nlst",
+    "nlst_base_path": "../NLST_with_second_large_cleaned",
+    "nlst_train_split": "train",
+    "nlst_val_split": "val",
+    "_comment_features": "FIRST-YEAR features only, enforced in nlst_dataset.py. Default exclusions drop the two identifiers; the label reaches the model through the expansion-flag embedding instead of the clinical vector. For literal NAMD parity set excluded_features to [] and clinical_dim to 16 (matches ehr_encoder.EHREncoder in_dim=16).",
+    "excluded_features": [
+      "unique_ids",
+      "year",
+      "label"
+    ],
+    "selected_features": null,
+    "normalize_clinical": true,
+    "augment": {
+      "flip": true,
+      "rotation": false,
+      "rotation_range_deg": 0
+    }
+  },
+  "ae": {
+    "use_latent_diffusion": true,
+    "ae_ckpt": "/scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs/autoencoder/checkpoints/checkpoint_best.pth",
+    "in_channels": 1,
+    "head_names": [
+      "ct"
+    ],
+    "channels": [
+      64,
+      128,
+      256
+    ],
+    "ae_input_size": 128,
+    "latent_size": 32,
+    "latent_channels": 4,
+    "_comment_stats": "Written by compute_latent_stats.py from /scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs/autoencoder/checkpoints/checkpoint_best.pth",
+    "mean": [
+      0.2783919571774112,
+      -0.09543154426350921,
+      -0.06584194939091643,
+      -0.20500210988985437
+    ],
+    "std": [
+      0.8430372172505894,
+      0.8869277624442888,
+      1.0636405239931335,
+      0.6729251581599339
+    ]
+  },
+  "model": {
+    "dim": 96,
+    "dim_mults": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "channels": 4,
+    "flash_attn": false,
+    "dropout": 0,
+    "use_clinical": true,
+    "clinical_dim": 13,
+    "use_expansion_flag_input": false,
+    "clinical_drop_prob": 0.1,
+    "expansion_flag_drop_prob": 0.0,
+    "context_slices": 1
+  },
+  "diffusion": {
+    "timesteps": 1000,
+    "sampling_timesteps": 250,
+    "objective": "pred_v",
+    "beta_schedule": "sigmoid",
+    "ddim_eta": 0,
+    "min_snr_loss_weight": true,
+    "min_snr_gamma": 1,
+    "segmentation_loss_weight": 0.0,
+    "latent_predict_delta": true
+  },
+  "_comment_budget": "One epoch is one pass of the balanced sampler = 2 * 725 majority samples = 91 steps at batch 16. `epochs` overrides `steps`. val/loss is evaluated every epoch (cheap, deterministic) and the best checkpoint is written to model-best.pt; the expensive sampling-based image metrics run on sample_metrics_every.",
+  "train": {
+    "batch_size": 16,
+    "grad_accum": 1,
+    "lr": 0.0001,
+    "epochs": 150,
+    "val_every": null,
+    "sample_metrics_every": 2275,
+    "ema_decay": 0.995,
+    "amp": true,
+    "save_every": 455,
+    "resume_checkpoint": null
+  },
+  "_comment_noflag": "NO ORACLE FLAG. HemExp's expansion-flag input maps to the NLST malignancy label, so conditioning on it leaks the label into the generated image: the flagged run scored ROC-AUC 0.9009 against a 0.8136 real-image ceiling, which is impossible for a faithful generator. The arms this is compared against (ctclip, pred_clip, alignvae) condition on a prompt built from feature indices 0..14 and never see the label at index 15. Setting use_expansion_flag_input=false removes the flag embedding entirely (verified: output is bit-identical for flag=0 vs flag=1). Clinical conditioning is unchanged: 13 dims of first-year biomarkers + EHR, with label already excluded."
+}

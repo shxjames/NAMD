@@ -1905,7 +1905,9 @@ class Trainer:
         nlst_normalize_clinical: bool = True,
         nlst_clinical_mean=None,
         nlst_clinical_std=None,
+        nlst_resize_mode: str = "resize",
         aux_names: tuple = ("iph", "ivh"),
+        balanced_sampler: bool = True,
     ):
         super().__init__()
 
@@ -1913,6 +1915,13 @@ class Trainer:
         if self.dataset_kind not in ("nifti", "nlst"):
             raise ValueError(f"dataset_kind must be 'nifti' or 'nlst', got {dataset_kind!r}")
         self.aux_names = tuple(aux_names)
+
+        # HemExp balances every batch 50/50 on the oracle flag. For NLST that
+        # flag is the malignancy label, and the NAMD arms this is compared with
+        # train on the natural ~19% positive rate, so balancing is a training
+        # asymmetry rather than parity. Off => plain shuffled batches at the
+        # dataset's own class ratio.
+        self.balanced_sampler = bool(balanced_sampler)
 
         self.accelerator = Accelerator(split_batches=split_batches, mixed_precision=mixed_precision_type if amp else "no")
 
@@ -1975,6 +1984,7 @@ class Trainer:
                 normalize_clinical=nlst_normalize_clinical,
                 clinical_mean=nlst_clinical_mean,
                 clinical_std=nlst_clinical_std,
+                resize_mode=nlst_resize_mode,
                 augment_flip=augment_flip,
                 augment_rotation=augment_rotation,
                 rotation_range_deg=rotation_range,
@@ -2004,22 +2014,39 @@ class Trainer:
 
         print(f"Train: {len(self.ds)} samples | Val: {len(val_ds)} samples | aux channels: {self.n_aux}")
 
-        val_sampler = ExpansionBalancedSampler(val_ds, batch_size=self.batch_size, drop_last=False)
-
-        val_loader = DataLoader(val_ds, batch_sampler=val_sampler, pin_memory=True, num_workers=worker_count)
+        if self.balanced_sampler:
+            val_loader = DataLoader(
+                val_ds,
+                batch_sampler=ExpansionBalancedSampler(val_ds, batch_size=self.batch_size, drop_last=False),
+                pin_memory=True, num_workers=worker_count,
+            )
+        else:
+            val_loader = DataLoader(
+                val_ds, batch_size=self.batch_size, shuffle=False,
+                pin_memory=True, num_workers=worker_count,
+            )
         self.val_dl = self.accelerator.prepare(val_loader)
 
         assert len(self.ds) >= self.batch_size, f"dataset has {len(self.ds)} samples, below one batch"
 
-        sampler = ExpansionBalancedSampler(self.ds, batch_size=train_batch_size)
+        if self.balanced_sampler:
+            sampler = ExpansionBalancedSampler(self.ds, batch_size=train_batch_size)
+            dl = DataLoader(self.ds, batch_sampler=sampler, pin_memory=True, num_workers=worker_count)
+            steps_per_epoch = len(sampler)
+        else:
+            dl = DataLoader(
+                self.ds, batch_size=train_batch_size, shuffle=True, drop_last=True,
+                pin_memory=True, num_workers=worker_count,
+            )
+            steps_per_epoch = len(dl)
 
-        dl = DataLoader(self.ds, batch_sampler=sampler, pin_memory=True, num_workers=worker_count)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
-        # One epoch is one pass of the balanced sampler, which oversamples the
-        # minority class -- so it is 2 * majority_count samples, not len(ds).
-        self.steps_per_epoch = max(1, len(sampler) // self.gradient_accumulate_every)
+        # With balancing on, one epoch is a pass of the balanced sampler
+        # (2 * majority_count samples, not len(ds)). With it off, it is a plain
+        # pass over the dataset.
+        self.steps_per_epoch = max(1, steps_per_epoch // self.gradient_accumulate_every)
 
         if self.train_num_epochs is not None:
             self.train_num_steps = int(self.train_num_epochs) * self.steps_per_epoch
@@ -2149,6 +2176,7 @@ class Trainer:
         augment_flip,
         augment_rotation,
         rotation_range_deg,
+        resize_mode="resize",
     ):
         """Paired NLST nodule datasets (year-1 -> year-2).
 
@@ -2163,6 +2191,7 @@ class Trainer:
         common = dict(
             base_path=base_path,
             image_size=image_size,
+            resize_mode=resize_mode,
             context_slices=self.context_slices,
             selected_features=selected_features,
             excluded_features=excluded_features,
@@ -2398,7 +2427,12 @@ class Trainer:
         sampler_model = self.ema.ema_model if (USE_EMA and hasattr(self, "ema")) else self.model
         sampler_model.eval()
 
-        eval_idx = self._balanced_val_indices(val_ds)
+        # Mirror the training regime: a 50/50 comparison set is only right when
+        # training is balanced too.
+        if self.balanced_sampler:
+            eval_idx = self._balanced_val_indices(val_ds)
+        else:
+            eval_idx = list(range(len(val_ds)))
 
         bs = int(self.batch_size)
         batches = [eval_idx[i : i + bs] for i in range(0, len(eval_idx), bs)]

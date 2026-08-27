@@ -170,6 +170,8 @@ trainer = Trainer(
     nlst_normalize_clinical=bool(cfg_data.get("normalize_clinical", True)),
     nlst_clinical_mean=cfg_data.get("clinical_mean"),
     nlst_clinical_std=cfg_data.get("clinical_std"),
+    nlst_resize_mode=cfg_data.get("resize_mode", "resize"),
+    balanced_sampler=bool(cfg_train.get("balanced_sampler", True)),
     aux_names=aux_names,
 )
 

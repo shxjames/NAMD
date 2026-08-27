@@ -43,18 +43,18 @@
     "ae_input_size": 128,
     "latent_size": 32,
     "latent_channels": 4,
-    "_comment_stats": "REPLACE with the output of compute_latent_stats.py for THIS autoencoder checkpoint. The placeholders below are identity whitening and will train, but badly scaled.",
+    "_comment_stats": "Written by compute_latent_stats.py from /scratch/liyues_root/liyues/shxjames/NAMD/HemExp_NLST_runs/autoencoder/checkpoints/checkpoint_best.pth",
     "mean": [
-      0.0,
-      0.0,
-      0.0,
-      0.0
+      0.2783919571774112,
+      -0.09543154426350921,
+      -0.06584194939091643,
+      -0.20500210988985437
     ],
     "std": [
-      1.0,
-      1.0,
-      1.0,
-      1.0
+      0.8430372172505894,
+      0.8869277624442888,
+      1.0636405239931335,
+      0.6729251581599339
     ]
   },
   "model": {

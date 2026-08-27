@@ -134,6 +134,7 @@ class NLSTPairedDataset(Dataset):
         base_path: str,
         split: str = "train",
         image_size: Optional[int] = None,
+        resize_mode: str = "resize",
         context_slices: int = 1,
         selected_features: Optional[Sequence[str]] = None,
         excluded_features: Optional[Sequence[str]] = None,
@@ -148,6 +149,16 @@ class NLSTPairedDataset(Dataset):
         self.base_path = base_path
         self.split = split
         self.image_size = image_size
+
+        # How to reach image_size from the native 128x128 patch.
+        #   "resize" -- bilinear downsample, keeps the whole field of view
+        #   "crop"   -- centre crop, MATCHES the NAMD benchmark: every arm in
+        #               nodule_quality_eval was built on patch[32:96, 32:96],
+        #               byte-identical to a centre crop and NOT to any
+        #               downsample. Use "crop" for a comparable arm.
+        if resize_mode not in ("resize", "crop"):
+            raise ValueError(f"resize_mode must be 'resize' or 'crop', got {resize_mode!r}")
+        self.resize_mode = resize_mode
         self.context_slices = int(context_slices)
         self.augment_flip = bool(augment_flip)
         self.augment_rotation = bool(augment_rotation)
@@ -255,9 +266,22 @@ class NLSTPairedDataset(Dataset):
         followup = torch.from_numpy(arr[:, w // 2 :].copy())[None]
 
         if self.image_size is not None and baseline.shape[-1] != self.image_size:
-            size = [self.image_size, self.image_size]
-            baseline = TF.resize(baseline, size, interpolation=InterpolationMode.BILINEAR, antialias=True)
-            followup = TF.resize(followup, size, interpolation=InterpolationMode.BILINEAR, antialias=True)
+            if self.resize_mode == "crop":
+                h, w = baseline.shape[-2:]
+                if self.image_size > min(h, w):
+                    raise ValueError(
+                        f"cannot crop {h}x{w} to {self.image_size}; crop must be smaller"
+                    )
+                top = (h - self.image_size) // 2
+                left = (w - self.image_size) // 2
+                sl_h = slice(top, top + self.image_size)
+                sl_w = slice(left, left + self.image_size)
+                baseline = baseline[..., sl_h, sl_w]
+                followup = followup[..., sl_h, sl_w]
+            else:
+                size = [self.image_size, self.image_size]
+                baseline = TF.resize(baseline, size, interpolation=InterpolationMode.BILINEAR, antialias=True)
+                followup = TF.resize(followup, size, interpolation=InterpolationMode.BILINEAR, antialias=True)
 
         return baseline, followup
 
@@ -311,6 +335,7 @@ class NLSTAutoencoderDataset(Dataset):
         base_path: str,
         split: str = "train",
         image_size: Optional[int] = None,
+        resize_mode: str = "resize",
         augment_flip: bool = False,
         augment_rotation: bool = False,
         rotation_range_deg: float = 0.0,
@@ -320,6 +345,7 @@ class NLSTAutoencoderDataset(Dataset):
             base_path=base_path,
             split=split,
             image_size=image_size,
+            resize_mode=resize_mode,
             context_slices=1,
             augment_flip=False,
             augment_rotation=False,
