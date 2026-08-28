@@ -35,6 +35,10 @@ from select_cases import (DEFAULT_NAMD_DIR, load_images, sigmoid,
 # essentially no alternatives.
 FAILURE_SAMPLES = [230, 357, 202, 203]
 
+CORRECT_C = "#1a7f37"
+WRONG_C = "#c8102e"
+
+
 def row_label(row, with_probs):
     txt = "malignant" if row.label == 1 else "benign"
     if with_probs:
@@ -43,16 +47,20 @@ def row_label(row, with_probs):
 
 
 def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
-              out_path, title, show_error=False, show_probs=False):
-    """show_probs adds the ViT malignancy probabilities to the row caption."""
+              out_path, title, show_error=False, show_probs=False, probs=None):
+    """show_probs puts the across-seed ViT malignancy probability in the row
+    caption and, when `probs` [S, N] is given, prints each seed's own
+    probability under its tile -- green where that seed's call matches the
+    ground-truth label, red where it does not."""
     n_rows = len(df)
     n_cols = 2 + len(seed_ids) + (1 if show_error else 0)
+    per_tile = show_probs and probs is not None
 
-    tile = 0.60
+    tile = 0.68 if per_tile else 0.60
     label_w = 1.20 if show_probs else 0.80
     fig_w = label_w + n_cols * tile
     head_h = 0.42
-    row_h = tile + 0.04
+    row_h = tile + (0.20 if per_tile else 0.04)
     fig_h = head_h + n_rows * row_h + 0.30
 
     fig = plt.figure(figsize=(fig_w, fig_h))
@@ -60,7 +68,7 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
         n_rows, n_cols,
         left=label_w / fig_w, right=0.998,
         bottom=0.02, top=1 - head_h / fig_h,
-        wspace=0.06, hspace=0.06)
+        wspace=0.06, hspace=0.30 if per_tile else 0.06)
 
     for r, (_, row) in enumerate(df.iterrows()):
         j = id_to_pos[int(row["sample"])]
@@ -78,6 +86,13 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
                 sp.set_visible(False)
             if r == 0:
                 ax.set_title(head, fontsize=7.5, pad=3)
+            if per_tile and c >= 2:
+                p = probs[c - 2, j]
+                ok = (p >= 0.5) == (row.label == 1)
+                ax.text(0.5, -0.06, f"{p:.2f}", transform=ax.transAxes,
+                        ha="center", va="top", fontsize=6.2,
+                        color=CORRECT_C if ok else WRONG_C,
+                        fontweight="normal" if ok else "bold")
 
         if show_error:
             ax = fig.add_subplot(gs[r, n_cols - 1])
@@ -133,7 +148,7 @@ def main():
     draw_grid(fail, t0, real, gen, seed_ids, id_to_pos,
               os.path.join(args.dir, "failure_grid.png"),
               "Representative failure cases of NAMD",
-              show_error=True, show_probs=True)
+              show_error=True, show_probs=True, probs=probs)
 
 
 if __name__ == "__main__":
