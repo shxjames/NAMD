@@ -30,12 +30,9 @@ from select_cases import (DEFAULT_NAMD_DIR, load_images, sigmoid,
 FAILURE_SAMPLES = [230, 233, 202, 203]
 
 def row_label(row, with_probs):
-    tag = "malignant" if row.label == 1 else "benign"
-    txt = f"#{int(row['sample'])}  {tag}\nLPIPS {row.lpips_mean:.3f}"
+    txt = "malignant" if row.label == 1 else "benign"
     if with_probs:
-        txt += (f"\np(mal) cond {row.prob_t0:.2f}"
-                f"\n       GT   {row.prob_real:.2f}"
-                f"\n       gen  {row.p_gen_mean:.2f}$\\pm${row.p_gen_std:.2f}")
+        txt += f"\np(mal) {row.p_gen_mean:.2f}$\\pm${row.p_gen_std:.2f}"
     return txt
 
 
@@ -46,7 +43,7 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
     n_cols = 2 + len(seed_ids) + (1 if show_error else 0)
 
     tile = 0.60
-    label_w = 1.70 if show_probs else 1.45
+    label_w = 1.20 if show_probs else 0.80
     fig_w = label_w + n_cols * tile
     head_h = 0.42
     row_h = tile + 0.04
