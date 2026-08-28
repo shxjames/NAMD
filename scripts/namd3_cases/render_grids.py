@@ -71,7 +71,8 @@ def row_label(row, with_probs):
 
 def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
               out_path, title, show_error=False, show_probs=False, probs=None,
-              contours=False, outline_sources=False):
+              contours=False, outline_sources=False,
+              p_cond=None, p_gt=None):
     """show_probs puts the across-seed ViT malignancy probability in the row
     caption and, when `probs` [S, N] is given, prints each seed's own
     probability under its tile -- green where that seed's call matches the
@@ -124,13 +125,19 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
                 elif outline_sources:
                     contour(ax, m_t0 if c == 0 else m_gt,
                             SELF_C if c == 0 else REF_C)
-            if per_tile and c >= 2:
-                p = probs[c - 2, j]
-                ok = (p >= 0.5) == (row.label == 1)
-                ax.text(0.5, -0.06, f"{p:.2f}", transform=ax.transAxes,
-                        ha="center", va="top", fontsize=6.2,
-                        color=CORRECT_C if ok else WRONG_C,
-                        fontweight="normal" if ok else "bold")
+            if per_tile:
+                if c == 0:
+                    p = None if p_cond is None else p_cond[j]
+                elif c == 1:
+                    p = None if p_gt is None else p_gt[j]
+                else:
+                    p = probs[c - 2, j]
+                if p is not None:
+                    ok = (p >= 0.5) == (row.label == 1)
+                    ax.text(0.5, -0.06, f"{p:.2f}", transform=ax.transAxes,
+                            ha="center", va="top", fontsize=6.2,
+                            color=CORRECT_C if ok else WRONG_C,
+                            fontweight="normal" if ok else "bold")
 
         if show_error:
             ax = fig.add_subplot(gs[r, n_cols - 1])
@@ -165,6 +172,9 @@ def main():
     npz = np.load(os.path.join(args.dir, "per_sample_seed_metrics.npz"))
     thr = youden_threshold(npz["labels"], npz["logit_real"][0])
     probs = sigmoid(npz["logit_gen"] - thr)          # [S, N] p(malignant)
+    # T0 and T1_real are identical across seeds, so row 0 is the whole story.
+    p_cond = sigmoid(npz["logit_t0"][0] - thr)       # [N]
+    p_gt = sigmoid(npz["logit_real"][0] - thr)       # [N]
 
     full = pd.read_csv(os.path.join(args.dir, "per_sample_metrics.csv"))
     succ = pd.read_csv(os.path.join(args.dir, "success_cases.csv"))
@@ -192,7 +202,8 @@ def main():
         draw_grid(fail, t0, real, gen, seed_ids, id_to_pos,
                   os.path.join(args.dir, f"failure_grid{suffix}.png"),
                   "Representative failure cases of NAMD" + (note if cont else ""),
-                  show_error=True, show_probs=True, probs=probs, contours=cont)
+                  show_error=True, show_probs=True, probs=probs, contours=cont,
+                  p_cond=p_cond, p_gt=p_gt)
 
 
 if __name__ == "__main__":
