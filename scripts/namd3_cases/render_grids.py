@@ -71,7 +71,7 @@ def row_label(row, with_probs):
 
 def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
               out_path, title, show_error=False, show_probs=False, probs=None,
-              contours=False):
+              contours=False, outline_sources=False):
     """show_probs puts the across-seed ViT malignancy probability in the row
     caption and, when `probs` [S, N] is given, prints each seed's own
     probability under its tile -- green where that seed's call matches the
@@ -99,6 +99,7 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
         gen_j = gen[:, j]
         if contours:
             s, lb = int(row["sample"]), int(row.label)
+            m_t0 = load_mask("T0", s, lb)
             m_gt = load_mask("T1_real", s, lb)
             m_gen = [load_mask("T1_gen", s, lb, seed=sd) for sd in seed_ids]
 
@@ -114,12 +115,15 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
                 sp.set_visible(False)
             if r == 0:
                 ax.set_title(head, fontsize=7.5, pad=3)
-            if contours and c >= 2:
-                # Only the generations are outlined; Cond and GT are left clean.
-                # The real follow-up's outline still sits under each generation
-                # so over- and under-growth read off the tile directly.
-                contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
-                contour(ax, m_gen[c - 2], SELF_C)
+            if contours:
+                if c >= 2:
+                    # The real follow-up's outline sits under each generation so
+                    # over- and under-growth read off the tile directly.
+                    contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
+                    contour(ax, m_gen[c - 2], SELF_C)
+                elif outline_sources:
+                    contour(ax, m_t0 if c == 0 else m_gt,
+                            SELF_C if c == 0 else REF_C)
             if per_tile and c >= 2:
                 p = probs[c - 2, j]
                 ok = (p >= 0.5) == (row.label == 1)
@@ -183,7 +187,7 @@ def main():
         draw_grid(succ, t0, real, gen, seed_ids, id_to_pos,
                   os.path.join(args.dir, f"success_grid{suffix}.png"),
                   "NAMD generations" + (note if cont else ""),
-                  contours=cont)
+                  contours=cont, outline_sources=True)
 
         draw_grid(fail, t0, real, gen, seed_ids, id_to_pos,
                   os.path.join(args.dir, f"failure_grid{suffix}.png"),
