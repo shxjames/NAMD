@@ -25,9 +25,12 @@ from select_cases import (DEFAULT_NAMD_DIR, load_images, sigmoid,
                           youden_threshold)
 
 # Hand-picked failures: two malignant then two benign, so the label split reads
-# straight off the figure. Within each pair the first is a perceptual collapse
-# and the second a classifier flip.
-FAILURE_SAMPLES = [230, 233, 202, 203]
+# straight off the figure. #230 and #202 are perceptual collapses; #203 is a
+# generation-induced classifier flip; #365 is a large irregular mass that the
+# model reproduces faithfully (area 200 vs 179 px) and the ViT still calls
+# benign -- on the real follow-up as well as the generations, so it is the
+# classifier failing rather than the generator.
+FAILURE_SAMPLES = [230, 365, 202, 203]
 
 def row_label(row, with_probs):
     txt = "malignant" if row.label == 1 else "benign"
