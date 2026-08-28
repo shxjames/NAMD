@@ -122,11 +122,11 @@ def main():
 
     draw_grid(succ, t0, real, gen, seed_ids, id_to_pos,
               os.path.join(args.dir, "success_grid.png"),
-              "NAMD_3 — faithful generations, all 20 seeds")
+              "NAMD generations")
 
     draw_grid(fail, t0, real, gen, seed_ids, id_to_pos,
               os.path.join(args.dir, "failure_grid.png"),
-              "NAMD_3 — failure cases, all 20 seeds",
+              "Representative failure cases of NAMD",
               show_error=True, show_probs=True)
 
 
