@@ -27,6 +27,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,6 +87,10 @@ DEFAULTS = {
     "log_interval": 100,
     "save_interval": 1000,
     "val_interval": None,
+    # NAMD-style light label supervision (configs/autoencoder/contrastive-VAE.yaml:
+    # label_loss_weight 0.2, BCEWithLogitsLoss on a linear head over the
+    # flattened sampled latent). 0.0 disables it.
+    "label_loss_weight": 0.2,
     "output_dir": "output/autoencoder_nlst",
     "resume_checkpoint": None,
     "seed": 123,
@@ -136,6 +141,18 @@ class MultiHeadAEKL(nn.Module):
         y, z_mu, z_sigma = self.backbone(x)
         return self._apply_heads(y), z_mu, z_sigma
 
+    def forward_with_latent(self, x):
+        """Like forward(), but also returns the SAMPLED latent z.
+
+        MONAI's AutoencoderKL.forward samples internally and does not expose z,
+        but the label head has to see the same z the decoder did -- NAMD's
+        corrae.py uses posterior.sample() for exactly this.
+        """
+        z_mu, z_sigma = self.backbone.encode(x)
+        z = self.backbone.sampling(z_mu, z_sigma)
+        y = self.backbone.decode(z)
+        return self._apply_heads(y), z_mu, z_sigma, z
+
     @torch.no_grad()
     def encode_stage_2_inputs(self, x):
         z_mu, z_sigma = self.backbone.encode(x)
@@ -144,6 +161,24 @@ class MultiHeadAEKL(nn.Module):
     @torch.no_grad()
     def decode(self, z):
         return self._apply_heads(self.backbone.decode(z))
+
+
+def _safe_wandb_init(**kwargs):
+    """wandb.init that cannot kill the run.
+
+    On any failure (the service process not starting, no network, a bad
+    entity) fall back to mode="disabled", which makes wandb.log() a no-op, so
+    training continues unlogged rather than crashing.
+    """
+    try:
+        return wandb.init(**kwargs)
+    except Exception as e:
+        print(f"[WARN] wandb.init failed ({type(e).__name__}: {e}); "
+              f"continuing with wandb DISABLED", flush=True)
+        try:
+            return wandb.init(mode="disabled")
+        except Exception:
+            return None
 
 
 def compute_kl(z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:
@@ -183,26 +218,59 @@ def log_reconstructions(model, loader, device, step, output_dir, max_images=8):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, kl_weight):
-    """Mean reconstruction / KL loss over the validation split."""
+def evaluate(model, loader, device, kl_weight, label_head=None, label_loss_weight=0.0):
+    """Mean reconstruction / KL loss over the validation split.
+
+    When a label head is supervised, also reports its BCE and its AUROC. The
+    AUROC is the diagnostic that matters: it says how much malignancy signal
+    the LATENT carries, which is the whole point of the auxiliary loss.
+    """
     was_training = model.training
     model.eval()
+    if label_head is not None:
+        label_head.eval()
 
-    recon_total, kl_total, n = 0.0, 0.0, 0
+    recon_total, kl_total, lbl_total, n = 0.0, 0.0, 0.0, 0
+    logits_all, labels_all = [], []
+
     for batch in loader:
         images = batch["image"].to(device)
-        recon, z_mu, z_sigma = model(images)
+        if label_head is not None:
+            recon, z_mu, z_sigma, z = model.forward_with_latent(images)
+        else:
+            recon, z_mu, z_sigma = model(images)
+            z = None
         b = images.shape[0]
         recon_total += float(((recon[:, 0:1] - images) ** 2).mean().item()) * b
         kl_total += float(compute_kl(z_mu, z_sigma).item()) * b
+
+        if label_head is not None:
+            y = batch["label"].to(device).float()
+            logit = label_head(z.reshape(b, -1)).squeeze(1)
+            lbl_total += float(F.binary_cross_entropy_with_logits(logit, y).item()) * b
+            logits_all.append(logit.detach().cpu())
+            labels_all.append(y.detach().cpu())
         n += b
 
     if was_training:
         model.train()
+        if label_head is not None:
+            label_head.train()
 
     recon = recon_total / max(1, n)
     kl = kl_total / max(1, n)
-    return {"val/recon": recon, "val/kl": kl, "val/loss": recon + kl_weight * kl}
+    out = {"val/recon": recon, "val/kl": kl, "val/loss": recon + kl_weight * kl}
+
+    if label_head is not None and logits_all:
+        lg = torch.cat(logits_all).numpy()
+        lb = torch.cat(labels_all).numpy()
+        out["val/label_bce"] = lbl_total / max(1, n)
+        if 0 < lb.sum() < len(lb):
+            from sklearn.metrics import roc_auc_score
+            out["val/label_auroc"] = float(roc_auc_score(lb, lg))
+        out["val/loss"] += label_loss_weight * out["val/label_bce"]
+
+    return out
 
 
 def main():
@@ -225,7 +293,7 @@ def main():
     device = accelerator.device
 
     if cfg["wandb_enabled"] and accelerator.is_main_process:
-        wandb.init(project=cfg["wandb_project"], config=cfg)
+        _safe_wandb_init(project=cfg["wandb_project"], config=cfg)
 
     train_ds = NLSTAutoencoderDataset(
         base_path=cfg["base_path"],
@@ -287,7 +355,27 @@ def main():
     else:
         perceptual_weight = 0.0
 
-    optimizer_g = torch.optim.Adam(model.parameters(), lr=float(cfg["lr_g"]))
+    # ---- NAMD-style light label supervision -------------------------------
+    # ldm/models/corrae.py: a single Linear over the FLATTENED SAMPLED latent to
+    # one logit, BCEWithLogitsLoss, added to the AE loss at weight 0.2. Kept
+    # OUTSIDE MultiHeadAEKL so the AE state dict stays byte-compatible with the
+    # diffusion stage, which loads it with strict=True.
+    label_loss_weight = float(cfg.get("label_loss_weight", 0.0))
+    label_head = None
+    if label_loss_weight > 0:
+        f_down = 2 ** (len(cfg["channels"]) - 1)
+        latent_hw = int(cfg["image_size"]) // f_down
+        flat_dim = int(cfg["latent_channels"]) * latent_hw * latent_hw
+        label_head = nn.Linear(flat_dim, 1).to(device)
+        print(f"label supervision ON: Linear({flat_dim}, 1), weight {label_loss_weight} "
+              f"(latent {cfg['latent_channels']}x{latent_hw}x{latent_hw})")
+    else:
+        print("label supervision OFF")
+
+    g_params = list(model.parameters())
+    if label_head is not None:
+        g_params += list(label_head.parameters())
+    optimizer_g = torch.optim.Adam(g_params, lr=float(cfg["lr_g"]))
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=float(cfg["lr_d"]))
 
     steps_per_epoch = max(1, len(train_loader) // int(cfg["accumulate_grad_batches"]))
@@ -336,10 +424,21 @@ def main():
             with accelerator.accumulate(model):
                 optimizer_g.zero_grad(set_to_none=True)
                 with accelerator.autocast():
-                    recon, z_mu, z_sigma = model(images)
+                    if label_head is not None:
+                        recon, z_mu, z_sigma, z = model.forward_with_latent(images)
+                    else:
+                        recon, z_mu, z_sigma = model(images)
+                        z = None
 
                     recon_loss = ((recon[:, 0:1] - images) ** 2).mean()
                     kl_loss = compute_kl(z_mu, z_sigma)
+
+                    if label_head is not None:
+                        y = batch["label"].to(device).float()
+                        logit = label_head(z.reshape(z.shape[0], -1)).squeeze(1)
+                        label_loss = F.binary_cross_entropy_with_logits(logit, y)
+                    else:
+                        label_loss = torch.zeros((), device=device)
 
                     if perceptual_loss is not None and pct_weight > 0:
                         p_loss = perceptual_loss(recon[:, 0:1].float(), images.float())
@@ -357,6 +456,7 @@ def main():
                         + float(cfg["kl_weight"]) * kl_loss
                         + pct_weight * p_loss
                         + adv_weight * gen_adv_loss
+                        + label_loss_weight * label_loss
                     )
 
                 accelerator.backward(loss_g)
@@ -386,6 +486,7 @@ def main():
             pbar.update(1)
 
             accum["recon"] += float(recon_loss.item())
+            accum["label"] = accum.get("label", 0.0) + float(label_loss.item())
             accum["kl"] += float(kl_loss.item())
             accum["percept"] += float(p_loss.item())
             accum["gen_adv"] += float(gen_adv_loss.item())
@@ -402,6 +503,7 @@ def main():
                     "train/perceptual": accum["percept"] / n,
                     "train/gen_adv": accum["gen_adv"] / n,
                     "train/disc": accum["disc"] / n,
+                    "train/label_bce": accum.get("label", 0.0) / n,
                     "lr_g": optimizer_g.param_groups[0]["lr"],
                     "lr_d": optimizer_d.param_groups[0]["lr"],
                 }
@@ -417,18 +519,31 @@ def main():
 
             if accelerator.is_main_process and global_step % val_interval == 0:
                 val_metrics = evaluate(
-                    accelerator.unwrap_model(model), val_loader, device, float(cfg["kl_weight"])
+                    accelerator.unwrap_model(model), val_loader, device, float(cfg["kl_weight"]),
+                    label_head=label_head, label_loss_weight=label_loss_weight,
                 )
                 val_metrics["epoch"] = global_step / steps_per_epoch
                 if cfg["wandb_enabled"]:
                     wandb.log(val_metrics, step=global_step)
+                extra = ""
+                if "val/label_auroc" in val_metrics:
+                    extra = (f" | label bce {val_metrics['val/label_bce']:.4f} "
+                             f"auroc {val_metrics['val/label_auroc']:.4f}")
                 print(
                     f"  step {global_step} (epoch {val_metrics['epoch']:.1f}): "
-                    f"val recon {val_metrics['val/recon']:.6f}"
+                    f"val recon {val_metrics['val/recon']:.6f}{extra}"
                 )
 
-                if val_metrics["val/loss"] < best_val:
-                    best_val = val_metrics["val/loss"]
+                # Select on RECONSTRUCTION, not the composite val/loss. The AE's
+                # job for the diffusion stage is faithful reconstruction, and the
+                # recon MSE here is ~1e-3 while the label BCE is ~0.7 -- including
+                # 0.2*BCE made the label term ~228x the recon term and pinned
+                # "best" to epoch 4 (recon 0.0095 vs 0.0007 by epoch 60). NAMD can
+                # monitor their composite safely because their LPIPS+NLL ae-loss
+                # is on a scale comparable to the BCE; this one is not.
+                selection_metric = val_metrics["val/recon"]
+                if selection_metric < best_val:
+                    best_val = selection_metric
                     ckpt_dir = os.path.join(output_dir, "checkpoints")
                     os.makedirs(ckpt_dir, exist_ok=True)
                     torch.save(
@@ -441,6 +556,9 @@ def main():
                             "head_names": ["ct"],
                             "in_channels": 1,
                             "val_loss": best_val,
+                            "label_head_state_dict":
+                                (label_head.state_dict() if label_head is not None else None),
+                            "label_loss_weight": label_loss_weight,
                         },
                         os.path.join(ckpt_dir, "checkpoint_best.pth"),
                     )
@@ -486,6 +604,9 @@ def main():
                 "latent_channels": int(cfg["latent_channels"]),
                 "head_names": ["ct"],
                 "in_channels": 1,
+                "label_head_state_dict":
+                    (label_head.state_dict() if label_head is not None else None),
+                "label_loss_weight": label_loss_weight,
             },
             os.path.join(ckpt_dir, "checkpoint_last.pth"),
         )

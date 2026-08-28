@@ -113,6 +113,24 @@ def load_stack_by_indices(
     return torch.stack(planes, dim=0)
 
 
+def _safe_wandb_init(**kwargs):
+    """wandb.init that cannot kill the run.
+
+    On any failure (the service process not starting, no network, a bad
+    entity) fall back to mode="disabled", which makes wandb.log() a no-op, so
+    training continues unlogged rather than crashing.
+    """
+    try:
+        return wandb.init(**kwargs)
+    except Exception as e:
+        print(f"[WARN] wandb.init failed ({type(e).__name__}: {e}); "
+              f"continuing with wandb DISABLED", flush=True)
+        try:
+            return wandb.init(mode="disabled")
+        except Exception:
+            return None
+
+
 def dataset_flags(dataset: Dataset) -> List[int]:
     """Per-sample binary conditioning flag, whichever dataset flavour is in use.
 
@@ -2111,9 +2129,12 @@ class Trainer:
             if wandb_entity:
                 wandb_init_kwargs["entity"] = wandb_entity
 
-            wandb.init(**wandb_init_kwargs)
+            _safe_wandb_init(**wandb_init_kwargs)
 
-            wandb.watch(self.model, log="all", log_freq=500)
+            try:
+                wandb.watch(self.model, log="all", log_freq=500)
+            except Exception as e:
+                print(f"[WARN] wandb.watch failed ({e}); continuing", flush=True)
 
     def _build_nifti_datasets(
         self,

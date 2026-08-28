@@ -368,4 +368,11 @@ class NLSTAutoencoderDataset(Dataset):
             angle = float((torch.rand(()) * 2 - 1).item() * self.rotation_range_deg)
             image = TF.rotate(image, angle, interpolation=InterpolationMode.BILINEAR)
 
-        return {"image": image.float(), "filename": s["subject_id"]}
+        # The label is needed for NAMD-style label supervision of the first
+        # stage. Both halves of a pair carry the same patient-level label,
+        # matching Lung_Pair_DS's autoencoder mode, which duplicates it.
+        return {
+            "image": image.float(),
+            "filename": s["subject_id"],
+            "label": torch.tensor(s["label"], dtype=torch.float32),
+        }
