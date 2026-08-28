@@ -99,7 +99,6 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
         gen_j = gen[:, j]
         if contours:
             s, lb = int(row["sample"]), int(row.label)
-            m_t0 = load_mask("T0", s, lb)
             m_gt = load_mask("T1_real", s, lb)
             m_gen = [load_mask("T1_gen", s, lb, seed=sd) for sd in seed_ids]
 
@@ -115,16 +114,12 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
                 sp.set_visible(False)
             if r == 0:
                 ax.set_title(head, fontsize=7.5, pad=3)
-            if contours:
-                if c == 0:
-                    contour(ax, m_t0, SELF_C)
-                elif c == 1:
-                    contour(ax, m_gt, REF_C)
-                else:
-                    # The real follow-up's outline sits under each generation so
-                    # over- and under-growth are visible without cross-referencing.
-                    contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
-                    contour(ax, m_gen[c - 2], SELF_C)
+            if contours and c >= 2:
+                # Only the generations are outlined; Cond and GT are left clean.
+                # The real follow-up's outline still sits under each generation
+                # so over- and under-growth read off the tile directly.
+                contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
+                contour(ax, m_gen[c - 2], SELF_C)
             if per_tile and c >= 2:
                 p = probs[c - 2, j]
                 ok = (p >= 0.5) == (row.label == 1)
@@ -182,7 +177,7 @@ def main():
 
     # Plain, then a MedSAM2-contoured variant of each; the plain versions stay
     # the default figures.
-    note = ("   (cyan = MedSAM2 nodule outline; "
+    note = ("   (cyan = generated nodule outline; "
             "dashed amber = real follow-up outline)")
     for cont, suffix in ((False, ""), (True, "_contours")):
         draw_grid(succ, t0, real, gen, seed_ids, id_to_pos,
