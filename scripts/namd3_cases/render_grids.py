@@ -71,7 +71,7 @@ def row_label(row, with_probs):
 
 def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
               out_path, title, show_error=False, show_probs=False, probs=None,
-              contours=False, outline_sources=False,
+              contours=False, outline_sources=False, ref_contour=True,
               p_cond=None, p_gt=None):
     """show_probs puts the across-seed ViT malignancy probability in the row
     caption and, when `probs` [S, N] is given, prints each seed's own
@@ -118,9 +118,10 @@ def draw_grid(df, t0, real, gen, seed_ids, id_to_pos,
                 ax.set_title(head, fontsize=7.5, pad=3)
             if contours:
                 if c >= 2:
-                    # The real follow-up's outline sits under each generation so
-                    # over- and under-growth read off the tile directly.
-                    contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
+                    if ref_contour:
+                        # The real follow-up's outline sits under each generation
+                        # so over/under-growth reads off the tile directly.
+                        contour(ax, m_gt, REF_C, ls="dashed", lw=0.55)
                     contour(ax, m_gen[c - 2], SELF_C)
                 elif outline_sources:
                     contour(ax, m_t0 if c == 0 else m_gt,
@@ -191,19 +192,20 @@ def main():
 
     # Plain, then a MedSAM2-contoured variant of each; the plain versions stay
     # the default figures.
-    note = ("   (cyan = generated nodule outline; "
-            "dashed amber = real follow-up outline)")
+    note_s = ("   (cyan = MedSAM2 nodule outline; "
+              "dashed amber = real follow-up outline)")
+    note_f = "   (cyan = MedSAM2 outline of the generated nodule)"
     for cont, suffix in ((False, ""), (True, "_contours")):
         draw_grid(succ, t0, real, gen, seed_ids, id_to_pos,
                   os.path.join(args.dir, f"success_grid{suffix}.png"),
-                  "NAMD generations" + (note if cont else ""),
+                  "NAMD generations" + (note_s if cont else ""),
                   contours=cont, outline_sources=True)
 
         draw_grid(fail, t0, real, gen, seed_ids, id_to_pos,
                   os.path.join(args.dir, f"failure_grid{suffix}.png"),
-                  "Representative failure cases of NAMD" + (note if cont else ""),
+                  "Representative failure cases of NAMD" + (note_f if cont else ""),
                   show_error=True, show_probs=True, probs=probs, contours=cont,
-                  p_cond=p_cond, p_gt=p_gt)
+                  ref_contour=False, p_cond=p_cond, p_gt=p_gt)
 
 
 if __name__ == "__main__":
