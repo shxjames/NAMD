@@ -283,3 +283,61 @@ Lowest-val reference: `epoch=45-val/loss=0.234.ckpt`.
 **val/loss is not comparable to the SD2.1 baseline's.** This arm scales latents
 by 0.519096 and the baseline by 0.580121, so the noise-prediction target lives on
 a different scale. The arms compare only through the downstream evals.
+
+---
+
+## Results: NAMD-on-SD2.1 vs the SD2.1 baseline
+
+Both arms were evaluated with the identical pipeline over the **same 450 test
+subjects and the same 20 seed ids** (verified: seed sets match exactly), so
+every comparison below is paired by seed. Nodule properties come from MedSAM2
+segmentation + PyRadiomics (`scripts/sd21_namd/nodule_eval.sbatch`, job
+27540638) into `nodule_quality_eval/results_sd21_namd_last/`.
+
+Checkpoints compared, both chosen by the select-late rule:
+- baseline `checkpoints/sd21-cond-full-bs32-lr1e-4/last.ckpt` (epoch 70)
+- this arm `checkpoints/sd21-namd-cond-bs16-lr2.0e-05/last.ckpt` (epoch 99)
+
+### Nodule-property metrics (9000 rows = 20 seeds x 450 samples)
+
+| metric | SD2.1 baseline e70 | NAMD-on-SD2.1 e99 | diff | paired t-test | seeds won |
+|---|---|---|---|---|---|
+| r_area | 0.6886 | 0.6910 | +0.0024 | p=0.69 (n.s.) | 10/20 |
+| r_HU | **0.7505** | 0.7164 | −0.0341 | p=4.3e-08 | 1/20 |
+| sphericity MAE ↓ | **0.1042** | 0.1086 | +0.0044 | p=1.4e-04 | 4/20 |
+| trajectory cosine | 0.3599 | 0.3556 | −0.0043 | p=0.11 (n.s.) | 5/20 |
+
+### Image-level metrics
+
+| metric | SD2.1 baseline e70 | NAMD-on-SD2.1 e99 |
+|---|---|---|
+| AUROC (avg_score) | 0.7872 ± 0.0129 | 0.7828 ± 0.0168 |
+| AUPRC (avg_score) | 0.3509 ± 0.0308 | 0.3519 ± 0.0403 |
+| LPIPS ↓ | **0.1890** | 0.2176 |
+| FID ↓ | 105.74 | **89.58** |
+
+### Reading
+
+**Applying NAMD's two-stage recipe to SD2.1 does not improve nodule fidelity
+over plain SD2.1.** Area correlation and trajectory cosine are ties; intensity
+correlation and sphericity are significantly *worse*, and the r_HU loss is
+consistent rather than noisy — the baseline wins 19 of 20 seeds. AUROC/AUPRC are
+also ties, well inside the seed spread.
+
+The one clear win is **FID 89.6 vs 105.7**, and it points at what the arm
+actually changed: distributional realism of the generated images improved while
+per-subject correspondence to the real follow-up got slightly worse. LPIPS moving
+the other way (0.218 vs 0.189) is the same story — the samples look more like
+plausible CTs in aggregate and less like *this patient's* follow-up.
+
+Mechanistically this is consistent with the stage-1→2 transfer noted above: only
+92.9% of stage 2 initialises from stage 1, and the cross-attention (`attn2.to_k`,
+`attn2.to_v`) is exactly what does *not* transfer in a CLIP→MedGemma handoff. The
+conditioning pathway is effectively trained from scratch at stage 2, so the extra
+stage buys backbone quality (FID) rather than conditioning fidelity (r_HU).
+
+Caveat worth keeping: the intensity bias grew — mean-intensity bias is −12.5
+here vs −5.5 for the baseline, and mean_shift over-predicts darkening (−16.6 gen
+vs −4.1 real). Malignant-subgroup r_HU is the one place this arm is clearly
+better (0.709 vs 0.646), but n=1060 of 9000 and it does not carry the pooled
+metric.
